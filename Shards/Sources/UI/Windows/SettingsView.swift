@@ -2,6 +2,7 @@ import Foundation
 import KeyboardShortcuts
 import SwiftData
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @State private var selectedTab: SettingsTab = .general
@@ -13,6 +14,7 @@ struct SettingsView: View {
         case appearance = "Appearance"
         case management = "Management"
         case advanced = "Advanced"
+        case diagnostics = "Diagnostics"
 
         var id: String { rawValue }
 
@@ -23,6 +25,7 @@ struct SettingsView: View {
             case .appearance: return "paintbrush"
             case .management: return "slider.horizontal.3"
             case .advanced: return "wrench.and.screwdriver"
+            case .diagnostics: return "stethoscope"
             }
         }
 
@@ -38,6 +41,8 @@ struct SettingsView: View {
                 return "Capture defaults, menu bar behavior, and tags."
             case .advanced:
                 return "Protection, Smart Mode, templates, and vault data."
+            case .diagnostics:
+                return "Storage, backups, updates, and troubleshooting details."
             }
         }
     }
@@ -83,6 +88,7 @@ struct SettingsView: View {
                 case .appearance: PersonalizationSettingsView()
                 case .management: ManagementSettingsView()
                 case .advanced: AdvancedSettingsView()
+                case .diagnostics: DiagnosticsSettingsView()
                 }
             }
             .frame(maxWidth: 680, alignment: .leading)
@@ -94,187 +100,6 @@ struct SettingsView: View {
         .scrollContentBackground(.hidden)
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.18))
     }
-}
-
-private struct SettingsSidebar: View {
-    @Binding var selection: SettingsView.SettingsTab
-    let accentColor: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "triangle.fill")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 30, height: 30)
-                    .background(accentColor, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Shards")
-                        .font(.headline)
-                    Text("Settings")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 24)
-            .padding(.bottom, 22)
-
-            VStack(spacing: 5) {
-                ForEach(SettingsView.SettingsTab.allCases) { tab in
-                    Button {
-                        selection = tab
-                    } label: {
-                        HStack(spacing: 11) {
-                            Image(systemName: tab.icon)
-                                .font(.system(size: 13, weight: .medium))
-                                .frame(width: 18)
-
-                            Text(tab.rawValue)
-                                .font(.subheadline.weight(selection == tab ? .semibold : .medium))
-
-                            Spacer(minLength: 0)
-                        }
-                        .foregroundStyle(selection == tab ? accentColor : .primary)
-                        .padding(.horizontal, 12)
-                        .frame(height: 36)
-                        .background(
-                            selection == tab ? accentColor.opacity(0.14) : .clear,
-                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        )
-                        .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
-                    .focusEffectDisabled()
-                    .accessibilityAddTraits(selection == tab ? .isSelected : [])
-                }
-            }
-            .padding(.horizontal, 10)
-
-            Spacer()
-
-            Text("Changes save automatically")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(18)
-        }
-        .frame(width: 196)
-        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.52))
-    }
-}
-
-private struct SettingsPageHeader: View {
-    let title: String
-    let summary: String
-    let icon: String
-    let accentColor: Color
-
-    var body: some View {
-        HStack(spacing: 15) {
-            Image(systemName: icon)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(accentColor)
-                .frame(width: 42, height: 42)
-                .background(accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                Text(summary)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .padding(.bottom, 4)
-    }
-}
-
-private struct SettingsCard<Content: View>: View {
-    let title: String
-    let summary: String?
-    let icon: String
-    @ViewBuilder let content: Content
-
-    init(
-        _ title: String,
-        icon: String,
-        summary: String? = nil,
-        @ViewBuilder content: () -> Content
-    ) {
-        self.title = title
-        self.icon = icon
-        self.summary = summary
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 20)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline)
-                    if let summary {
-                        Text(summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            content
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color(nsColor: .controlBackgroundColor).opacity(0.72),
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(.separator.opacity(0.38), lineWidth: 0.5)
-        }
-    }
-}
-
-private struct SettingsNote: View {
-    let text: String
-
-    var body: some View {
-        Label(text, systemImage: "info.circle")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-}
-
-private enum AppBuildInfo {
-    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development"
-    static let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-    static let gitCommit: String = buildMetadata.commit
-    static let hasLocalChanges: Bool = buildMetadata.hasLocalChanges
-
-    private static let buildMetadata: (commit: String, hasLocalChanges: Bool) = {
-        guard
-            let url = Bundle.main.url(forResource: "BuildInfo", withExtension: "plist"),
-            let data = try? Data(contentsOf: url),
-            let propertyList = try? PropertyListSerialization.propertyList(from: data, format: nil),
-            let values = propertyList as? [String: Any]
-        else {
-            return ("Unavailable", false)
-        }
-
-        return (
-            values["GitCommit"] as? String ?? "Unavailable",
-            values["GitDirty"] as? Bool ?? false
-        )
-    }()
 }
 
 // MARK: - General
@@ -363,6 +188,8 @@ private struct GeneralSettingsView: View {
                     }
                 }
             }
+
+            SoftwareUpdateSettingsCard()
         }
     }
 
@@ -449,201 +276,6 @@ private struct EditorSettingsView: View {
                 SettingsNote(text: "Changes are saved 1.5 seconds after your last edit. Press ⌘S to save immediately.")
             }
         }
-    }
-}
-
-// MARK: - Personalization
-
-private struct PersonalizationSettingsView: View {
-    @AppStorage("vault_sidebar_compact") private var vaultSidebarCompact = false
-    @AppStorage("custom_accent_hex") private var customAccentHex = ""
-    @AppStorage(AppSettingKeys.backgroundStyle) private var backgroundStyle = "system"
-    @AppStorage(AppSettingKeys.backgroundColorHex) private var bgColorHex = "#1A1A2E"
-    @AppStorage(AppSettingKeys.backgroundGradientFrom) private var gradientFrom = "#0F0C29"
-    @AppStorage(AppSettingKeys.backgroundGradientTo) private var gradientTo = "#302B63"
-    @AppStorage(AppSettingKeys.backgroundGlassTintHex) private var glassTintHex = "#4F46E5"
-    @AppStorage(AppSettingKeys.backgroundOpacity) private var backgroundOpacity = 1.0
-    @AppStorage(AppSettingKeys.backgroundColorOpacity) private var backgroundColorOpacity = 1.0
-    @AppStorage(AppSettingKeys.editorFontSize) private var editorFontSize = 15.0
-
-    private let bgStyles: [(id: String, label: String, icon: String)] = [
-        ("system", "System", "laptopcomputer"),
-        ("solid", "Solid Color", "paintpalette.fill"),
-        ("gradient", "Gradient", "circle.lefthalf.filled"),
-        ("glass", "Glass", "rectangle.on.rectangle"),
-        ("tinted_glass", "Tinted Glass", "circle.hexagongrid.fill"),
-    ]
-
-    // Whether current background style uses a custom color that can have its own opacity
-    private var styleSupportsColorOpacity: Bool {
-        ["solid", "gradient", "tinted_glass"].contains(backgroundStyle)
-    }
-
-    private var backgroundOpacityLabel: String {
-        switch backgroundStyle {
-        case "glass", "tinted_glass":
-            return "Surface Strength"
-        default:
-            return "Opacity"
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 16) {
-            SettingsCard(
-                "Accent Color",
-                icon: "paintbrush.pointed.fill",
-                summary: "Used for selection, primary actions, and interactive accents."
-            ) {
-                HStack(spacing: 12) {
-                    ColorPicker("", selection: Binding(
-                        get: { Color(hex: customAccentHex) ?? Color(red: 79/255, green: 70/255, blue: 229/255) },
-                        set: { customAccentHex = $0.toHex() ?? customAccentHex }
-                    ))
-                    .labelsHidden()
-                    .frame(width: 28, height: 28)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Custom Accent")
-                            .font(.body)
-                        Text("Applied to buttons, icons, and interactive elements")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    if !customAccentHex.isEmpty {
-                        Button("Reset") {
-                            withAnimation { customAccentHex = "" }
-                        }
-                        .controlSize(.small)
-                        .buttonStyle(.bordered)
-                    }
-                }
-            }
-
-            SettingsCard(
-                "Window Background",
-                icon: "rectangle.3.group.fill",
-                summary: "Preview changes before returning to your vault."
-            ) {
-                backgroundPreview
-                    .frame(height: 96)
-                    .compositingGroup()
-                    .clipShape(.rect(cornerRadius: 11))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .strokeBorder(.separator, lineWidth: 0.5)
-                    }
-
-                Picker("Style", selection: $backgroundStyle) {
-                    ForEach(bgStyles, id: \.id) { style in
-                        Label(style.label, systemImage: style.icon)
-                            .tag(style.id as String)
-                    }
-                }
-
-                switch backgroundStyle {
-                case "solid":
-                    ColorPicker("Background Color", selection: Binding(
-                        get: { Color(hex: bgColorHex) ?? .black },
-                        set: { bgColorHex = $0.toHex() ?? bgColorHex }
-                    ))
-                case "gradient":
-                    ColorPicker("From", selection: Binding(
-                        get: { Color(hex: gradientFrom) ?? .black },
-                        set: { gradientFrom = $0.toHex() ?? gradientFrom }
-                    ))
-                    ColorPicker("To", selection: Binding(
-                        get: { Color(hex: gradientTo) ?? .indigo },
-                        set: { gradientTo = $0.toHex() ?? gradientTo }
-                    ))
-                case "tinted_glass":
-                    ColorPicker("Tint Color", selection: Binding(
-                        get: { Color(hex: glassTintHex) ?? .indigo },
-                        set: { glassTintHex = $0.toHex() ?? glassTintHex }
-                    ))
-                default:
-                    EmptyView()
-                }
-
-                opacitySlider(
-                    label: backgroundOpacityLabel,
-                    value: $backgroundOpacity,
-                    range: 0.0...1.0
-                )
-
-                if styleSupportsColorOpacity {
-                    opacitySlider(
-                        label: "Color Intensity",
-                        value: $backgroundColorOpacity,
-                        range: 0.0...1.0
-                    )
-                }
-
-                if backgroundStyle == "system" {
-                    SettingsNote(text: "System follows the current macOS light or dark appearance.")
-                }
-            }
-
-            SettingsCard(
-                "Typography",
-                icon: "textformat.size",
-                summary: "Adjust the writing size without changing stored content."
-            ) {
-                HStack(spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Editor Font Size")
-                            Spacer()
-                            Text("\(Int(editorFontSize))pt")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                                .frame(minWidth: 32, alignment: .trailing)
-                        }
-                        Slider(value: $editorFontSize, in: 12...24, step: 1)
-                    }
-                }
-
-                HStack {
-                    Text("Preview:")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    Text("The quick brown fox")
-                        .font(.system(size: editorFontSize))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
-                }
-                .padding(.vertical, 2)
-            }
-
-            SettingsCard("List Layout", icon: "list.bullet.rectangle") {
-                Toggle("Compact List", isOn: $vaultSidebarCompact)
-                SettingsNote(text: "Compact mode hides previews and dates while keeping icons and tags visible.")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func opacitySlider(label: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(label)
-                Spacer()
-                Text("\(Int(value.wrappedValue * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 36, alignment: .trailing)
-            }
-            Slider(value: value, in: range, step: 0.05)
-        }
-    }
-
-    @ViewBuilder
-    private var backgroundPreview: some View {
-        AppBackgroundView()
     }
 }
 
@@ -1055,7 +687,7 @@ private struct AdvancedSettingsView: View {
                     Button("Export CSV…") { exportCSV() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                    Button("Import JSON…") { importJSON() }
+                    Button("Import JSON or Backup…") { importJSON() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
@@ -1245,7 +877,11 @@ private struct AdvancedSettingsView: View {
 
     private func importJSON() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.json]
+        if let backupType = UTType(filenameExtension: "shardsbackup", conformingTo: .json) {
+            panel.allowedContentTypes = [.json, backupType]
+        } else {
+            panel.allowedContentTypes = [.json]
+        }
         panel.allowsMultipleSelection = false
         panel.beginSheetModal(for: NSApp.keyWindow ?? NSWindow()) { response in
             guard response == .OK, let url = panel.url else { return }
@@ -1376,71 +1012,6 @@ private struct AdvancedSettingsView: View {
     }
 }
 
-// MARK: - Export/Import Models
-
-struct ShardExport: Codable {
-    var id, encryptionMode: String
-    var collectionId: String?
-    var tagIds: [String]
-    var isPinned: Bool
-    var displayName: String?
-    var deletedAt: Date?
-    var payload: String
-    var createdAt, updatedAt: Date
-
-    init(shard: Shard) {
-        id = shard.id; collectionId = shard.collectionId; tagIds = shard.tagIds
-        encryptionMode = shard.encryptionMode.rawValue; isPinned = shard.isPinned
-        displayName = shard.displayName; deletedAt = shard.deletedAt; payload = shard.payload
-        createdAt = shard.createdAt; updatedAt = shard.updatedAt
-    }
-}
-
-struct TagExport: Codable {
-    var id, name, colorHex, symbol: String
-    var isSystem: Bool
-    init(tag: Tag) {
-        id = tag.id
-        name = tag.name
-        colorHex = tag.colorHex
-        symbol = tag.symbol
-        isSystem = tag.isSystem
-    }
-}
-
-struct TemplateExport: Codable {
-    var id, name, symbol, targetCollectionName, schemaFieldsJSON: String
-    var targetTagName: String?
-    var orderIndex: Int
-    init(template: PresetTemplate) {
-        id = template.id; name = template.name; symbol = template.symbol
-        targetCollectionName = template.targetCollectionName
-        targetTagName = template.targetTagName
-        schemaFieldsJSON = template.schemaFieldsJSON; orderIndex = template.orderIndex
-    }
-}
-
-struct CollectionExport: Codable {
-    var id, name, icon: String
-    var parentId: String?
-    var createdAt: Date
-    init(collection: ShardCollection) {
-        id = collection.id
-        name = collection.name
-        icon = collection.icon
-        parentId = collection.parentId
-        createdAt = collection.createdAt
-    }
-}
-
-struct ExportPackage: Codable {
-    var shards: [ShardExport]
-    var tags: [TagExport]
-    var templates: [TemplateExport]
-    var collections: [CollectionExport]
-    var exportedAt: Date
-}
-
 private struct ImportedTemplate: Codable {
     var name, symbol, targetCollectionName: String
     var schema: PresetTemplateSchema
@@ -1450,115 +1021,5 @@ private struct ImportedTemplate: Codable {
         let schemaJSON = String(data: data, encoding: .utf8) ?? "{}"
         return PresetTemplate(name: name, symbol: symbol, targetCollectionName: targetCollectionName,
                               schemaFieldsJSON: schemaJSON, orderIndex: orderIndex)
-    }
-}
-
-// MARK: - Color Extension
-
-extension Color {
-    func toHex() -> String? {
-        guard let cgColor = self.cgColor, let components = cgColor.components, components.count >= 3 else { return nil }
-        return String(format: "#%02lX%02lX%02lX",
-                      lroundf(Float(components[0]) * 255),
-                      lroundf(Float(components[1]) * 255),
-                      lroundf(Float(components[2]) * 255))
-    }
-}
-
-// MARK: - SF Symbol Picker
-
-struct SymbolPickerButton: View {
-    @Binding var symbol: String
-    var color: Color = .secondary
-    @State private var showPicker = false
-    @State private var searchText = ""
-
-    private static let symbols: [(category: String, icons: [String])] = [
-        ("General", ["tag.fill", "bookmark.fill", "star.fill", "heart.fill", "flag.fill",
-                     "bell.fill", "bolt.fill", "flame.fill", "leaf.fill", "drop.fill"]),
-        ("Objects", ["key.fill", "lock.fill", "folder.fill", "doc.fill", "creditcard.fill",
-                     "cart.fill", "gift.fill", "house.fill", "building.2.fill", "briefcase.fill"]),
-        ("Communication", ["envelope.fill", "phone.fill", "message.fill", "bubble.left.fill",
-                          "at", "globe", "link", "antenna.radiowaves.left.and.right", "wifi", "network"]),
-        ("People", ["person.fill", "person.2.fill", "person.crop.circle.fill",
-                    "figure.stand", "hand.raised.fill", "brain.head.profile"]),
-        ("Media", ["camera.fill", "photo.fill", "video.fill", "music.note", "play.fill",
-                   "paintbrush.fill", "pencil", "scissors", "wand.and.stars", "sparkles"]),
-        ("Shapes", ["circle.fill", "square.fill", "triangle.fill", "diamond.fill",
-                    "hexagon.fill", "shield.fill", "seal.fill", "app.fill"]),
-    ]
-
-    var body: some View {
-        Button {
-            showPicker.toggle()
-        } label: {
-            Image(systemName: symbol)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(color)
-                .frame(width: 28, height: 28)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $showPicker, arrowEdge: .bottom) {
-            VStack(spacing: 0) {
-                // Search / custom input
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.tertiary)
-                    TextField("Search or type SF Symbol name…", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .onSubmit {
-                            if !searchText.isEmpty { symbol = searchText; showPicker = false }
-                        }
-                }
-                .padding(10)
-
-                Divider()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(filteredSymbols, id: \.category) { group in
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(group.category)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.leading, 4)
-
-                                LazyVGrid(columns: Array(repeating: GridItem(.fixed(32), spacing: 4), count: 8), spacing: 4) {
-                                    ForEach(group.icons, id: \.self) { icon in
-                                        Button {
-                                            symbol = icon
-                                            showPicker = false
-                                        } label: {
-                                            Image(systemName: icon)
-                                                .font(.system(size: 14))
-                                                .frame(width: 32, height: 32)
-                                                .foregroundStyle(symbol == icon ? .white : .primary)
-                                                .background(
-                                                    symbol == icon ? AnyShapeStyle(color) : AnyShapeStyle(.clear),
-                                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                                )
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(10)
-                }
-            }
-            .frame(width: 300, height: 320)
-        }
-    }
-
-    private var filteredSymbols: [(category: String, icons: [String])] {
-        if searchText.isEmpty { return Self.symbols }
-        let query = searchText.lowercased()
-        return Self.symbols.compactMap { group in
-            let filtered = group.icons.filter { $0.lowercased().contains(query) }
-            return filtered.isEmpty ? nil : (group.category, filtered)
-        }
     }
 }

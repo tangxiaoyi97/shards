@@ -23,7 +23,7 @@ class VaultContainer {
         in: .userDomainMask
     ).first!
         .appendingPathComponent("Shards", isDirectory: true)
-    private static let storeURL = vaultDirectory
+    static let storeURL = vaultDirectory
         .appendingPathComponent("Shards.store")
 
     private init() {

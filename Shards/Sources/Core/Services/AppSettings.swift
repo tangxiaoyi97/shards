@@ -12,6 +12,8 @@ enum AppSettingKeys {
     static let backgroundOpacity = "background_opacity"
     static let backgroundColorOpacity = "background_color_opacity"
     static let editorFontSize = "editor_font_size"
+    static let appearance = "app_appearance"
+    static let lastUpdateCheckDate = "last_update_check_date"
 
     static let llmEndpointURL = "llm_endpoint_url"
     static let llmAPIToken = "llm_api_token"

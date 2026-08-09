@@ -1,8 +1,59 @@
 import AppKit
+import SwiftData
 import XCTest
 @testable import Shards
 
 final class ShardsCoreTests: XCTestCase {
+    func testAppearanceMapsToExpectedColorScheme() {
+        XCTAssertNil(AppAppearance.system.preferredColorScheme)
+        XCTAssertEqual(AppAppearance.light.preferredColorScheme, .light)
+        XCTAssertEqual(AppAppearance.dark.preferredColorScheme, .dark)
+    }
+
+    func testLegacyExportPackageDecodesWithoutBackupMetadata() throws {
+        let data = Data(#"{"shards":[],"tags":[],"templates":[],"collections":[],"exportedAt":0}"#.utf8)
+
+        let package = try JSONDecoder().decode(ExportPackage.self, from: data)
+
+        XCTAssertNil(package.formatVersion)
+        XCTAssertNil(package.attachments)
+        XCTAssertNil(package.reason)
+    }
+
+    @MainActor
+    func testVaultBackupCapturesDataAndSanitizesFilename() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(
+            for: Shard.self,
+            Tag.self,
+            PresetTemplate.self,
+            ShardCollection.self,
+            ShardAttachment.self,
+            configurations: configuration
+        )
+        container.mainContext.insert(Shard(id: "test-shard", payload: "Local note"))
+
+        let service = VaultBackupService(
+            container: container,
+            backupDirectoryURL: temporaryDirectory
+        )
+        let summary = try service.createBackup(reason: .preUpdate(targetVersion: "1.2/RC"))
+        let data = try Data(contentsOf: summary.url)
+        let package = try JSONDecoder().decode(ExportPackage.self, from: data)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: summary.url.path))
+        XCTAssertFalse(summary.url.lastPathComponent.contains("/"))
+        XCTAssertEqual(package.formatVersion, 2)
+        XCTAssertEqual(package.reason, "pre-update-1.2/RC")
+        XCTAssertEqual(package.shards.map(\.id), ["test-shard"])
+        XCTAssertEqual(package.shards.first?.payload, "Local note")
+    }
+
     func testLegacyBackgroundMigrationCopiesExistingValues() {
         let suiteName = "ShardsCoreTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {

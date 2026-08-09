@@ -26,6 +26,16 @@
 		C0EAC37BB4A226967457E400 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2E0C6209D98B3DE3A98F2965 /* Assets.xcassets */; };
 		F3B84E77685EA1C06A96D908 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 466F0820536BC9B591821498 /* AppDelegate.swift */; };
 		FA3C4B9C902D4F81A2B6D7E8 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = E1A7C5D4B8F94039A6C2E7D1 /* THIRD_PARTY_NOTICES.md */; };
+		A10000000000000000000001 /* AppAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* AppAppearance.swift */; };
+		A10000000000000000000002 /* VaultArchiveModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* VaultArchiveModels.swift */; };
+		A10000000000000000000003 /* VaultBackupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* VaultBackupService.swift */; };
+		A10000000000000000000004 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* UpdateController.swift */; };
+		A10000000000000000000005 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* SettingsComponents.swift */; };
+		A10000000000000000000006 /* AppearanceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* AppearanceSettingsView.swift */; };
+		A10000000000000000000007 /* DiagnosticsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* DiagnosticsSettingsView.swift */; };
+		A10000000000000000000008 /* MainWindowComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* MainWindowComponents.swift */; };
+		A10000000000000000000009 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D10000000000000000000001 /* Sparkle */; };
+		A10000000000000000000010 /* AppBuildInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* AppBuildInfo.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +69,16 @@
 		E1A7C5D4B8F94039A6C2E7D1 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		EDB540CA49FE27A52EE0C0AB /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		F012ABDCFF99053A65A698C8 /* ProtectionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtectionService.swift; sourceTree = "<group>"; };
+		B10000000000000000000001 /* AppAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppAppearance.swift; sourceTree = "<group>"; };
+		B10000000000000000000002 /* VaultArchiveModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultArchiveModels.swift; sourceTree = "<group>"; };
+		B10000000000000000000003 /* VaultBackupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultBackupService.swift; sourceTree = "<group>"; };
+		B10000000000000000000004 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
+		B10000000000000000000005 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
+		B10000000000000000000006 /* AppearanceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettingsView.swift; sourceTree = "<group>"; };
+		B10000000000000000000007 /* DiagnosticsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsSettingsView.swift; sourceTree = "<group>"; };
+		B10000000000000000000008 /* MainWindowComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowComponents.swift; sourceTree = "<group>"; };
+		B10000000000000000000010 /* AppBuildInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppBuildInfo.swift; sourceTree = "<group>"; };
+		B10000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -67,6 +87,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				77F55436822E9147FF4249B4 /* KeyboardShortcuts in Frameworks */,
+				A10000000000000000000009 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -148,6 +169,7 @@
 			isa = PBXGroup;
 			children = (
 				2E0C6209D98B3DE3A98F2965 /* Assets.xcassets */,
+				B10000000000000000000011 /* Info.plist */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -165,10 +187,15 @@
 		9F7180B8F9BB5158A9C852D7 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				B10000000000000000000001 /* AppAppearance.swift */,
+				B10000000000000000000010 /* AppBuildInfo.swift */,
 				226927F9AC4C23EE5F747EB1 /* AppSettings.swift */,
 				F012ABDCFF99053A65A698C8 /* ProtectionService.swift */,
 				B55D6DF77A2C82CA8CBF7416 /* ShardExportService.swift */,
 				354E168CA744F0C1CD2F09ED /* SmartInputService.swift */,
+				B10000000000000000000004 /* UpdateController.swift */,
+				B10000000000000000000002 /* VaultArchiveModels.swift */,
+				B10000000000000000000003 /* VaultBackupService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -205,8 +232,12 @@
 		DFCCBEEEF79CC1FF983FE481 /* Windows */ = {
 			isa = PBXGroup;
 			children = (
+				B10000000000000000000006 /* AppearanceSettingsView.swift */,
+				B10000000000000000000007 /* DiagnosticsSettingsView.swift */,
 				D201CBDEDE5621E63C691CF2 /* MainWindow.swift */,
+				B10000000000000000000008 /* MainWindowComponents.swift */,
 				54C5FFEE5C7207B950481BD3 /* SettingsView.swift */,
+				B10000000000000000000005 /* SettingsComponents.swift */,
 			);
 			path = Windows;
 			sourceTree = "<group>";
@@ -230,6 +261,7 @@
 			name = Shards;
 			packageProductDependencies = (
 				35A881477EAE3ADA515B94D1 /* KeyboardShortcuts */,
+				D10000000000000000000001 /* Sparkle */,
 			);
 			productName = Shards;
 			productReference = 7ACF96FBBE6C1C87DAFA7275 /* Shards.app */;
@@ -275,6 +307,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				1C48715E0FEC90366A8C7836 /* XCRemoteSwiftPackageReference "KeyboardShortcuts" */,
+				C10000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 62BEF4753A58DF2A6A05909E /* Products */;
@@ -336,19 +369,28 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000001 /* AppAppearance.swift in Sources */,
+				A10000000000000000000010 /* AppBuildInfo.swift in Sources */,
 				982B1AD2E40749576B704D90 /* AppBackgroundView.swift in Sources */,
 				F3B84E77685EA1C06A96D908 /* AppDelegate.swift in Sources */,
 				068E8FE6D9C02E4D98A9FFEF /* AppSettings.swift in Sources */,
 				93935735AA9DAA84220C9E0A /* MainWindow.swift in Sources */,
+				A10000000000000000000008 /* MainWindowComponents.swift in Sources */,
 				7A25674333A04343575216CC /* Models.swift in Sources */,
 				22722306EBF75736861B1C72 /* PayloadRendererView.swift in Sources */,
 				B2AEF274A36402BCE3BCE934 /* ProtectionService.swift in Sources */,
 				B8668E1AC7FE47FCB80FC248 /* QuickEntryContentView.swift in Sources */,
 				61E42B42DEBCD624FC3FE304 /* QuickEntryPanel.swift in Sources */,
 				3B3285AF6B5B493AE90415F4 /* SettingsView.swift in Sources */,
+				A10000000000000000000006 /* AppearanceSettingsView.swift in Sources */,
+				A10000000000000000000007 /* DiagnosticsSettingsView.swift in Sources */,
+				A10000000000000000000005 /* SettingsComponents.swift in Sources */,
 				13B0D259C266E1B90842FB41 /* ShardExportService.swift in Sources */,
 				4E9CBC381DA9CDCFFC0ADF91 /* ShardsApp.swift in Sources */,
 				AAABCA472B89FA78EA0F2CFD /* SmartInputService.swift in Sources */,
+				A10000000000000000000004 /* UpdateController.swift in Sources */,
+				A10000000000000000000002 /* VaultArchiveModels.swift in Sources */,
+				A10000000000000000000003 /* VaultBackupService.swift in Sources */,
 				A3890AC41DABE66AFD45510C /* VaultContainer.swift in Sources */,
 				4B084D5594906014E84E786F /* VisualEffectView.swift in Sources */,
 			);
@@ -507,16 +549,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Tang Xiaoyi";
+				CURRENT_PROJECT_VERSION = 2;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Shards/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tangxiaoyi.Shards;
 				SDKROOT = macosx;
 				SWIFT_STRICT_CONCURRENCY = complete;
@@ -529,16 +570,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Tang Xiaoyi";
+				CURRENT_PROJECT_VERSION = 2;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Shards/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tangxiaoyi.Shards;
 				SDKROOT = macosx;
 				SWIFT_STRICT_CONCURRENCY = complete;
@@ -605,6 +645,14 @@
 				minimumVersion = 1.16.0;
 			};
 		};
+		C10000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.9.5;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -612,6 +660,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 1C48715E0FEC90366A8C7836 /* XCRemoteSwiftPackageReference "KeyboardShortcuts" */;
 			productName = KeyboardShortcuts;
+		};
+		D10000000000000000000001 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C10000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

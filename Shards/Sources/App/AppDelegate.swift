@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         clearLegacyWindowRestorationState()
+        AppAppearance.current.applyToApplication()
         ProtectionService.shared.refreshConfiguration()
         setupMenuBar()
         setupQuickEntryPanel()
@@ -61,6 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              forKeyPath: "hide_dock_icon",
                              options: [.new],
                              context: nil)
+        defaults.addObserver(self,
+                             forKeyPath: AppSettingKeys.appearance,
+                             options: [.new],
+                             context: nil)
     }
 
     override func observeValue(forKeyPath keyPath: String?,
@@ -71,11 +76,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { [weak self] in
                 self?.applyDockIconPreference()
             }
+        } else if keyPath == AppSettingKeys.appearance {
+            DispatchQueue.main.async {
+                AppAppearance.current.applyToApplication()
+            }
         }
     }
 
     deinit {
         UserDefaults.standard.removeObserver(self, forKeyPath: "hide_dock_icon")
+        UserDefaults.standard.removeObserver(self, forKeyPath: AppSettingKeys.appearance)
     }
 
     // Clicking the Dock icon brings the main window to the front

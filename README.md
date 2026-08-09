@@ -7,7 +7,7 @@
 <p align="center">A local macOS vault for quick notes</p>
 
 <p align="center">
-  <img alt="Version 1.0" src="https://img.shields.io/badge/version-1.0-5B4CF0">
+  <img alt="Version 1.1 preview" src="https://img.shields.io/badge/version-1.1_preview-5B4CF0">
   <img alt="macOS 15 or later" src="https://img.shields.io/badge/platform-macOS_15%2B-111111">
   <img alt="Swift 6" src="https://img.shields.io/badge/language-Swift_6-F05138">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2563EB">
@@ -25,6 +25,8 @@ Shards turns quick notes, clipboard text, and reusable templates into searchable
 - Reusable templates for structured information.
 - Optional Smart mode with an editable preview; it does not read historical Vault content.
 - Global or per-Shard password protection, JSON/CSV import and export.
+- System, Light, and Dark appearances; manual signed updates through Sparkle.
+- Update-safety backups and a diagnostics page for local troubleshooting.
 
 ![Shards settings](docs/images/shards-settings.jpeg)
 
@@ -35,6 +37,7 @@ Shards turns quick notes, clipboard text, and reusable templates into searchable
 - Protected payloads use CryptoKit AES-GCM; titles and metadata may remain unencrypted.
 - Smart mode sends only the current draft and template schema to your configured endpoint.
 - The optional LLM token is stored in local preferences, not Keychain.
+- Safety backups live beside the Vault and may contain ordinary Shards as readable JSON.
 
 Shards is a personal capture tool, not a dedicated password manager. Exported files should be handled according to the sensitivity of their contents.
 
@@ -48,9 +51,9 @@ xcodebuild -project Shards.xcodeproj -scheme Shards \
   SWIFT_STRICT_CONCURRENCY=complete test
 ```
 
-Create a local release package with `zsh scripts/package-release.sh`. Public distribution requires Developer ID signing and notarization; see [docs/release.md](docs/release.md).
+Create a local package with `zsh scripts/package-release.sh`. Prepare a Sparkle-signed GitHub update with `zsh scripts/prepare-sparkle-release.sh`. Developer ID signing and notarization are still required to avoid Gatekeeper warnings on other Macs; see [docs/release.md](docs/release.md).
 
-The bundle identifier is `com.tangxiaoyi.Shards`. Version 1.0 migrates known preferences from the former `com.yourdomain.Shards` domain.
+The bundle identifier is `com.tangxiaoyi.Shards`. Version 1.0 migrated known preferences from the former `com.yourdomain.Shards` domain.
 
 ## credits
 

@@ -161,6 +161,6 @@ fi
 
 echo
 echo "Next steps:"
-echo "  1. Notarize the zip or DMG with xcrun notarytool."
-echo "  2. Staple the notarized artifact."
-echo "  3. Distribute the notarized app/DMG, not the raw local-sign build."
+echo "  1. Without an Apple Developer account, distribute this as an unsigned personal build."
+echo "  2. For a warning-free public build, sign with Developer ID, notarize, and staple it."
+echo "  3. For Sparkle, use scripts/prepare-sparkle-release.sh to sign the update archive."
