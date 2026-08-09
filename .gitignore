@@ -1,0 +1,43 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode user data and build products
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.dSYM
+*.dSYM.zip
+*.xcarchive
+*.profraw
+
+# Swift Package Manager local state
+.build/
+.swiftpm/
+
+# Release artifacts and logs
+release/
+*.log
+
+# Local assistant/editor configuration
+.claude/
+.codex/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.p12
+*.pem
+*.mobileprovision
+
+# Temporary files
+*.tmp
+*.swp
+*~
