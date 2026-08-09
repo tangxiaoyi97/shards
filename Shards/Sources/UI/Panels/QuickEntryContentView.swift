@@ -2,9 +2,26 @@ import AppKit
 import SwiftData
 import SwiftUI
 
-private enum QuickEntryMode: Hashable {
+enum QuickEntryMode: Hashable {
     case smart
     case template(String)
+}
+
+enum QuickEntryModeCycle {
+    static func next(
+        from currentMode: QuickEntryMode,
+        in availableModes: [QuickEntryMode],
+        reverse: Bool
+    ) -> QuickEntryMode? {
+        guard !availableModes.isEmpty else { return nil }
+        guard let currentIndex = availableModes.firstIndex(of: currentMode) else {
+            return reverse ? availableModes.last : availableModes.first
+        }
+
+        let offset = reverse ? -1 : 1
+        let nextIndex = (currentIndex + offset + availableModes.count) % availableModes.count
+        return availableModes[nextIndex]
+    }
 }
 
 private enum QuickEntryLayout {
@@ -97,6 +114,14 @@ struct QuickEntryContentView: View {
         selectedMode != .smart && payloadBuffer.count > 1
     }
 
+    private var availableModes: [QuickEntryMode] {
+        var modes = templates.map { QuickEntryMode.template($0.id) }
+        if hasLLMConfigured {
+            modes.insert(.smart, at: 0)
+        }
+        return modes
+    }
+
     private var isShowingStatusFeedback: Bool {
         statusText.contains("Fail") || statusText.contains("Saved") || statusText.contains("failed")
     }
@@ -185,7 +210,6 @@ struct QuickEntryContentView: View {
             RoundedRectangle(cornerRadius: QuickEntryPanelMetrics.cornerRadius, style: .continuous)
                 .strokeBorder(.primary.opacity(0.13), lineWidth: 0.5)
         )
-        .animation(interfaceAnimation, value: selectedMode)
         .animation(interfaceAnimation, value: isProcessing)
         .animation(interfaceAnimation, value: isShowingStatusFeedback)
         .animation(interfaceAnimation, value: isShowingSmartPreview)
@@ -406,7 +430,7 @@ struct QuickEntryContentView: View {
     private var modePickerView: some View {
         Menu {
             Button {
-                selectSmartMode()
+                selectSmartMode(preservingDraft: inputText)
             } label: {
                 Label("Smart", systemImage: "sparkles")
             }
@@ -416,7 +440,7 @@ struct QuickEntryContentView: View {
 
             ForEach(templates) { template in
                 Button {
-                    select(template: template)
+                    select(template: template, preservingDraft: inputText)
                 } label: {
                     Label(template.name, systemImage: template.symbol)
                 }
@@ -427,6 +451,18 @@ struct QuickEntryContentView: View {
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(appAccentColor)
                     .contentTransition(.symbolEffect(.replace))
+
+                Text(modeDisplayName)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .frame(maxWidth: 92, alignment: .leading)
+
+                Text("Tab")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
 
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
@@ -478,8 +514,10 @@ struct QuickEntryContentView: View {
         .disabled(isProcessing)
         .onKeyPress(keys: [.tab], phases: .down) { keyPress in
             guard !isShowingSmartPreview else { return .ignored }
-            withAnimation(interfaceAnimation) {
-                handleTab(isReverse: keyPress.modifiers.contains(.shift))
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                cycleMode(reverse: keyPress.modifiers.contains(.shift))
             }
             return .handled
         }
@@ -504,6 +542,18 @@ struct QuickEntryContentView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
             } else {
                 if supportsStepping {
+                    if currentFieldIndex > 0 {
+                        Button(action: moveToPreviousField) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 16, height: 16)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Previous field")
+                        .help("Previous field")
+                    }
+
                     Text("\(currentFieldIndex + 1)/\(payloadBuffer.count)")
                         .font(.system(size: 13, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -618,18 +668,21 @@ struct QuickEntryContentView: View {
         }
     }
 
-    private func select(template: PresetTemplate) {
+    private func select(template: PresetTemplate, preservingDraft draft: String? = nil) {
         smartPreview = nil
         selectedMode = .template(template.id)
         storedSelectedMode = "template:\(template.id)"
         payloadBuffer = template.fields.isEmpty ? [PresetField(name: "Content", value: "", isRequired: true)] : template.fields
+        if let draft, !draft.isEmpty, !payloadBuffer.isEmpty {
+            payloadBuffer[0].value = draft
+        }
         currentFieldIndex = 0
         inputText = payloadBuffer.first?.value ?? ""
         statusText = template.name
         requestInputFocus()
     }
 
-    private func selectSmartMode() {
+    private func selectSmartMode(preservingDraft draft: String? = nil) {
         guard hasLLMConfigured else {
             apply(mode: resolveMode(from: defaultQuickEntryMode))
             return
@@ -638,9 +691,9 @@ struct QuickEntryContentView: View {
         smartPreview = nil
         selectedMode = .smart
         storedSelectedMode = "smart"
-        payloadBuffer = [PresetField(name: "Content", value: "", isRequired: true)]
+        payloadBuffer = [PresetField(name: "Content", value: draft ?? "", isRequired: true)]
         currentFieldIndex = 0
-        inputText = ""
+        inputText = draft ?? ""
         statusText = "Smart"
         requestInputFocus()
     }
@@ -650,13 +703,20 @@ struct QuickEntryContentView: View {
         return name.contains("password") || name.contains("secret") || name.contains("token")
     }
 
-    private func handleTab(isReverse: Bool) {
-        guard !payloadBuffer.isEmpty else { return }
-        guard selectedMode != .smart else { return }
-        if isReverse {
-            moveToPreviousField()
-        } else {
-            moveToNextField()
+    private func cycleMode(reverse: Bool) {
+        guard let nextMode = QuickEntryModeCycle.next(
+            from: selectedMode,
+            in: availableModes,
+            reverse: reverse
+        ) else { return }
+
+        let draft = inputText
+        switch nextMode {
+        case .smart:
+            selectSmartMode(preservingDraft: draft)
+        case let .template(templateID):
+            guard let template = templates.first(where: { $0.id == templateID }) else { return }
+            select(template: template, preservingDraft: draft)
         }
     }
 
@@ -806,12 +866,7 @@ struct QuickEntryContentView: View {
 
             statusText = "Saved!"
             isProcessing = false
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                initializeFlow(forceDefault: true)
-                dismissPanel()
-                (NSApp.delegate as? AppDelegate)?.showToast(message: "Shard saved")
-            }
+            completeAndDismissPanel()
 
         } catch {
             statusText = "Save failed"
@@ -821,6 +876,14 @@ struct QuickEntryContentView: View {
 
     private func dismissPanel() {
         (NSApp.delegate as? AppDelegate)?.dismissQuickEntryPanel()
+    }
+
+    private func completeAndDismissPanel() {
+        DispatchQueue.main.async {
+            guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+            appDelegate.completeQuickEntryPanel()
+            appDelegate.showToast(message: "Shard saved")
+        }
     }
 
     private func smartFailureStatusText(for error: Error) -> String {

@@ -339,6 +339,77 @@ final class ShardsCoreTests: XCTestCase {
         XCTAssertEqual(metrics.glassTintOpacity, 0)
     }
 
+    func testQuickEntryTabCyclesForwardThroughEveryMode() {
+        let modes: [QuickEntryMode] = [
+            .smart,
+            .template("shard"),
+            .template("token")
+        ]
+
+        XCTAssertEqual(
+            QuickEntryModeCycle.next(from: .smart, in: modes, reverse: false),
+            .template("shard")
+        )
+        XCTAssertEqual(
+            QuickEntryModeCycle.next(from: .template("token"), in: modes, reverse: false),
+            .smart
+        )
+    }
+
+    func testQuickEntryShiftTabCyclesBackwardAndWraps() {
+        let modes: [QuickEntryMode] = [
+            .smart,
+            .template("shard"),
+            .template("token")
+        ]
+
+        XCTAssertEqual(
+            QuickEntryModeCycle.next(from: .smart, in: modes, reverse: true),
+            .template("token")
+        )
+        XCTAssertEqual(
+            QuickEntryModeCycle.next(from: .template("token"), in: modes, reverse: true),
+            .template("shard")
+        )
+        XCTAssertNil(QuickEntryModeCycle.next(from: .smart, in: [], reverse: false))
+    }
+
+    func testQuickEntryPanelMotionKeepsHorizontalCenterAndUsesCompactTransforms() {
+        let restingFrame = NSRect(x: 100, y: 200, width: 600, height: 64)
+        let presentationFrame = QuickEntryPanelMotion.presentationFrame(for: restingFrame)
+        let dismissalFrame = QuickEntryPanelMotion.dismissalFrame(for: restingFrame)
+
+        XCTAssertEqual(presentationFrame.midX, restingFrame.midX, accuracy: 0.001)
+        XCTAssertEqual(dismissalFrame.midX, restingFrame.midX, accuracy: 0.001)
+        XCTAssertGreaterThan(presentationFrame.midY, restingFrame.midY)
+        XCTAssertGreaterThan(dismissalFrame.midY, restingFrame.midY)
+        XCTAssertLessThan(presentationFrame.width, restingFrame.width)
+        XCTAssertLessThan(dismissalFrame.width, presentationFrame.width)
+    }
+
+    @MainActor
+    func testQuickEntryDustAnimatorStartsAndCancelsWithoutPersistingASnapshot() {
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: QuickEntryPanelMetrics.compactSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let contentView = NSView(frame: NSRect(origin: .zero, size: QuickEntryPanelMetrics.compactSize))
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        panel.contentView = contentView
+        panel.orderFront(nil)
+        defer { panel.orderOut(nil) }
+
+        let animator = QuickEntryDustAnimator()
+        XCTAssertTrue(animator.play(from: panel) {})
+        XCTAssertTrue(animator.isAnimating)
+
+        animator.cancel()
+        XCTAssertFalse(animator.isAnimating)
+    }
+
     @MainActor
     func testQuickEntryPanelRoutesEscapeBeforeResponderChain() throws {
         let panel = QuickEntryPanel(

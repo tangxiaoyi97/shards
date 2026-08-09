@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toastTask: Task<Void, Never>?
     private var menuDispatchWorkItem: DispatchWorkItem?
     private var quickEntryTransitionState = QuickEntryTransitionState()
+    private let quickEntryDustAnimator = QuickEntryDustAnimator()
     private let defaults = UserDefaults.standard
 
     override init() {
@@ -360,6 +361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        quickEntryDustAnimator.cancel()
         quickEntryTransitionState.beginPresentation()
 
         // Signal the existing SwiftUI view to reset its state. Do NOT
@@ -374,10 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let restingFrame = quickEntryPanel.frame
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if !reduceMotion {
-            quickEntryPanel.setFrame(
-                restingFrame.offsetBy(dx: 0, dy: QuickEntryPanelMetrics.presentationOffset),
-                display: false
-            )
+            quickEntryPanel.setFrame(QuickEntryPanelMotion.presentationFrame(for: restingFrame), display: false)
         }
 
         NSApp.activate(ignoringOtherApps: true)
@@ -385,8 +384,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quickEntryPanel.makeKey()
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.12 : 0.2
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.duration = reduceMotion ? 0.1 : 0.18
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
             quickEntryPanel.animator().alphaValue = 1
             if !reduceMotion {
                 quickEntryPanel.animator().setFrame(restingFrame, display: true)
@@ -395,6 +394,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func dismissQuickEntryPanel() {
+        dismissQuickEntryPanel(completedCapture: false)
+    }
+
+    func completeQuickEntryPanel() {
+        dismissQuickEntryPanel(completedCapture: true)
+    }
+
+    private func dismissQuickEntryPanel(completedCapture: Bool) {
         guard let quickEntryPanel,
               quickEntryPanel.isVisible,
               let transitionGeneration = quickEntryTransitionState.beginDismissal()
@@ -404,11 +411,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let restingFrame = quickEntryPanel.frame
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let dismissedFrame = restingFrame.offsetBy(dx: 0, dy: QuickEntryPanelMetrics.presentationOffset)
+        let dismissedFrame = QuickEntryPanelMotion.dismissalFrame(for: restingFrame)
+
+        if completedCapture, !reduceMotion {
+            let startedDustEffect = quickEntryDustAnimator.play(from: quickEntryPanel) { [weak self, weak quickEntryPanel] in
+                guard let self,
+                      let quickEntryPanel,
+                      self.quickEntryTransitionState.isCurrentDismissal(
+                          generation: transitionGeneration
+                      )
+                else {
+                    return
+                }
+
+                quickEntryPanel.setFrame(restingFrame, display: false)
+                quickEntryPanel.alphaValue = 1
+                _ = self.quickEntryTransitionState.finishDismissal(
+                    generation: transitionGeneration
+                )
+            }
+
+            if startedDustEffect {
+                quickEntryPanel.orderOut(nil)
+                return
+            }
+        }
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.1 : 0.16
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.duration = reduceMotion ? 0.08 : 0.14
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
             quickEntryPanel.animator().alphaValue = 0
             if !reduceMotion {
                 quickEntryPanel.animator().setFrame(dismissedFrame, display: true)
