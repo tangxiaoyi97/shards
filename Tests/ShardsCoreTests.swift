@@ -374,40 +374,71 @@ final class ShardsCoreTests: XCTestCase {
         XCTAssertNil(QuickEntryModeCycle.next(from: .smart, in: [], reverse: false))
     }
 
-    func testQuickEntryPanelMotionKeepsHorizontalCenterAndUsesCompactTransforms() {
-        let restingFrame = NSRect(x: 100, y: 200, width: 600, height: 64)
-        let presentationFrame = QuickEntryPanelMotion.presentationFrame(for: restingFrame)
-        let dismissalFrame = QuickEntryPanelMotion.dismissalFrame(for: restingFrame)
+    func testQuickEntryFadeTimingStaysShortAndUsesOpacityOnlyState() {
+        let timing = QuickEntryFadeTiming.standard
 
-        XCTAssertEqual(presentationFrame.midX, restingFrame.midX, accuracy: 0.001)
-        XCTAssertEqual(dismissalFrame.midX, restingFrame.midX, accuracy: 0.001)
-        XCTAssertGreaterThan(presentationFrame.midY, restingFrame.midY)
-        XCTAssertGreaterThan(dismissalFrame.midY, restingFrame.midY)
-        XCTAssertLessThan(presentationFrame.width, restingFrame.width)
-        XCTAssertLessThan(dismissalFrame.width, presentationFrame.width)
+        XCTAssertGreaterThan(timing.presentationDuration, 0)
+        XCTAssertLessThanOrEqual(timing.presentationDuration, 0.2)
+        XCTAssertGreaterThan(timing.dismissalDuration, 0)
+        XCTAssertLessThanOrEqual(timing.dismissalDuration, 0.2)
+        XCTAssertGreaterThan(timing.reducedMotionDuration, 0)
+        XCTAssertLessThanOrEqual(
+            timing.reducedMotionDuration,
+            timing.dismissalDuration
+        )
     }
 
     @MainActor
-    func testQuickEntryDustAnimatorStartsAndCancelsWithoutPersistingASnapshot() {
+    func testQuickEntryPresentationStateCanFadeInAndOut() {
+        let presentationState = QuickEntryPresentationState()
+
+        XCTAssertFalse(presentationState.isContentVisible)
+
+        presentationState.setContentVisible(true, duration: 0)
+        XCTAssertTrue(presentationState.isContentVisible)
+
+        presentationState.setContentVisible(false, duration: 0)
+        XCTAssertFalse(presentationState.isContentVisible)
+    }
+
+    @MainActor
+    func testQuickEntryDismissalHidesPanelAndResetsForNextPresentation() {
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: QuickEntryPanelMetrics.compactSize),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        let contentView = NSView(frame: NSRect(origin: .zero, size: QuickEntryPanelMetrics.compactSize))
-        contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        panel.contentView = contentView
+        panel.contentView = NSView(
+            frame: NSRect(origin: .zero, size: QuickEntryPanelMetrics.compactSize)
+        )
         panel.orderFront(nil)
         defer { panel.orderOut(nil) }
 
-        let animator = QuickEntryDustAnimator()
-        XCTAssertTrue(animator.play(from: panel) {})
-        XCTAssertTrue(animator.isAnimating)
+        let controller = QuickEntryPanelTransitionController(timing: .immediate)
+        controller.beginPresentation()
+        controller.present(reduceMotion: false)
 
-        animator.cancel()
-        XCTAssertFalse(animator.isAnimating)
+        XCTAssertTrue(panel.isVisible)
+        XCTAssertTrue(controller.presentationState.isContentVisible)
+
+        controller.dismiss(
+            panel: panel,
+            completedCapture: true,
+            reduceMotion: false
+        )
+
+        XCTAssertFalse(panel.isVisible)
+        XCTAssertFalse(controller.presentationState.isContentVisible)
+        XCTAssertFalse(controller.isDismissing)
+        XCTAssertEqual(panel.alphaValue, 1)
+
+        controller.beginPresentation()
+        panel.orderFront(nil)
+        controller.present(reduceMotion: false)
+
+        XCTAssertTrue(panel.isVisible)
+        XCTAssertTrue(controller.presentationState.isContentVisible)
     }
 
     @MainActor
@@ -460,6 +491,20 @@ final class ShardsCoreTests: XCTestCase {
         XCTAssertNil(state.beginDismissal())
         XCTAssertTrue(state.isCurrentDismissal(generation: generation))
         XCTAssertTrue(state.finishDismissal(generation: generation))
+        XCTAssertFalse(state.isDismissing)
+    }
+
+    func testQuickEntryCompletedDismissalSupersedesInFlightResignKeyDismissal() throws {
+        var state = QuickEntryTransitionState()
+        state.beginPresentation()
+        let resignKeyGeneration = try XCTUnwrap(state.beginDismissal())
+        let completedCaptureGeneration = try XCTUnwrap(
+            state.beginDismissal(replacingCurrent: true)
+        )
+
+        XCTAssertNotEqual(resignKeyGeneration, completedCaptureGeneration)
+        XCTAssertFalse(state.isCurrentDismissal(generation: resignKeyGeneration))
+        XCTAssertTrue(state.finishDismissal(generation: completedCaptureGeneration))
         XCTAssertFalse(state.isDismissing)
     }
 

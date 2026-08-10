@@ -31,8 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toastPanel: NSPanel?
     private var toastTask: Task<Void, Never>?
     private var menuDispatchWorkItem: DispatchWorkItem?
-    private var quickEntryTransitionState = QuickEntryTransitionState()
-    private let quickEntryDustAnimator = QuickEntryDustAnimator()
+    private let quickEntryTransitionController = QuickEntryPanelTransitionController()
     private let defaults = UserDefaults.standard
 
     override init() {
@@ -161,7 +160,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshQuickEntryPanelContent(_ panel: QuickEntryPanel? = nil) {
         guard let targetPanel = panel ?? quickEntryPanel else { return }
         let container = VaultContainer.shared.container
-        let hosting = TransparentHostingView(rootView: QuickEntryContentView().modelContainer(container))
+        let actions = QuickEntryActions(captureCompleted: { [weak self] in
+            self?.completeQuickEntryPanel()
+        })
+        let hosting = TransparentHostingView(
+            rootView: QuickEntryContentView(
+                actions: actions,
+                presentationState: quickEntryTransitionController.presentationState
+            )
+            .modelContainer(container)
+        )
         hosting.sizingOptions = []
         targetPanel.contentView = hosting
         targetPanel.setContentSize(QuickEntryPanelMetrics.compactSize)
@@ -361,8 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        quickEntryDustAnimator.cancel()
-        quickEntryTransitionState.beginPresentation()
+        quickEntryTransitionController.beginPresentation()
 
         // Signal the existing SwiftUI view to reset its state. Do NOT
         // replace contentView here — creating a new NSHostingView every
@@ -370,26 +377,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // view's onReceive subscription is ready, breaking initialisation.
         NotificationCenter.default.post(name: .quickEntryWillOpen, object: nil)
         quickEntryPanel.setContentSize(QuickEntryPanelMetrics.compactSize)
-        quickEntryPanel.alphaValue = 0
+        quickEntryPanel.alphaValue = 1
         quickEntryPanel.center()
-
-        let restingFrame = quickEntryPanel.frame
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        if !reduceMotion {
-            quickEntryPanel.setFrame(QuickEntryPanelMotion.presentationFrame(for: restingFrame), display: false)
-        }
 
         NSApp.activate(ignoringOtherApps: true)
         quickEntryPanel.orderFrontRegardless()
         quickEntryPanel.makeKey()
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.1 : 0.18
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
-            quickEntryPanel.animator().alphaValue = 1
-            if !reduceMotion {
-                quickEntryPanel.animator().setFrame(restingFrame, display: true)
-            }
+        quickEntryPanel.displayIfNeeded()
+        Task { @MainActor [weak self, weak quickEntryPanel] in
+            await Task.yield()
+            guard quickEntryPanel?.isVisible == true else { return }
+            self?.quickEntryTransitionController.present(reduceMotion: reduceMotion)
         }
     }
 
@@ -402,67 +401,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func dismissQuickEntryPanel(completedCapture: Bool) {
-        guard let quickEntryPanel,
-              quickEntryPanel.isVisible,
-              let transitionGeneration = quickEntryTransitionState.beginDismissal()
-        else {
-            return
-        }
-
-        let restingFrame = quickEntryPanel.frame
+        guard let quickEntryPanel else { return }
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let dismissedFrame = QuickEntryPanelMotion.dismissalFrame(for: restingFrame)
-
-        if completedCapture, !reduceMotion {
-            let startedDustEffect = quickEntryDustAnimator.play(from: quickEntryPanel) { [weak self, weak quickEntryPanel] in
-                guard let self,
-                      let quickEntryPanel,
-                      self.quickEntryTransitionState.isCurrentDismissal(
-                          generation: transitionGeneration
-                      )
-                else {
-                    return
-                }
-
-                quickEntryPanel.setFrame(restingFrame, display: false)
-                quickEntryPanel.alphaValue = 1
-                _ = self.quickEntryTransitionState.finishDismissal(
-                    generation: transitionGeneration
-                )
-            }
-
-            if startedDustEffect {
-                quickEntryPanel.orderOut(nil)
-                return
-            }
-        }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.08 : 0.14
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
-            quickEntryPanel.animator().alphaValue = 0
-            if !reduceMotion {
-                quickEntryPanel.animator().setFrame(dismissedFrame, display: true)
-            }
-        } completionHandler: { [weak self, weak quickEntryPanel] in
-            Task { @MainActor in
-                guard let self,
-                      let quickEntryPanel,
-                      self.quickEntryTransitionState.isCurrentDismissal(
-                          generation: transitionGeneration
-                      )
-                else {
-                    return
-                }
-
-                quickEntryPanel.orderOut(nil)
-                quickEntryPanel.setFrame(restingFrame, display: false)
-                quickEntryPanel.alphaValue = 1
-                _ = self.quickEntryTransitionState.finishDismissal(
-                    generation: transitionGeneration
-                )
-            }
-        }
+        quickEntryTransitionController.dismiss(
+            panel: quickEntryPanel,
+            completedCapture: completedCapture,
+            reduceMotion: reduceMotion
+        )
     }
 
     private func resolveStatusBarDoubleClickTagIDs(from tags: [Tag]) -> [String] {

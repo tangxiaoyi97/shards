@@ -40,7 +40,14 @@ extension Notification.Name {
     static let quickEntryWillOpen = Notification.Name("quickEntryWillOpen")
 }
 
+struct QuickEntryActions {
+    let captureCompleted: @MainActor () -> Void
+}
+
 struct QuickEntryContentView: View {
+    let actions: QuickEntryActions
+    let presentationState: QuickEntryPresentationState
+
     @Query(sort: \PresetTemplate.orderIndex) private var templates: [PresetTemplate]
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -60,8 +67,17 @@ struct QuickEntryContentView: View {
     @State private var inputText = ""
     @State private var statusText = "Ready"
     @State private var isProcessing = false
+    @State private var isCompletingCapture = false
     @State private var smartPreview: SmartPreviewState?
     @FocusState private var isInputFocused: Bool
+
+    init(
+        actions: QuickEntryActions,
+        presentationState: QuickEntryPresentationState
+    ) {
+        self.actions = actions
+        self.presentationState = presentationState
+    }
 
     private var inputFieldIdentity: String {
         let secureToken = currentField.map(isSecureField) == true ? "secure" : "plain"
@@ -122,8 +138,8 @@ struct QuickEntryContentView: View {
         return modes
     }
 
-    private var isShowingStatusFeedback: Bool {
-        statusText.contains("Fail") || statusText.contains("Saved") || statusText.contains("failed")
+    private var isShowingFailureFeedback: Bool {
+        statusText.lowercased().contains("fail")
     }
 
     private var isShowingSmartPreview: Bool {
@@ -210,8 +226,11 @@ struct QuickEntryContentView: View {
             RoundedRectangle(cornerRadius: QuickEntryPanelMetrics.cornerRadius, style: .continuous)
                 .strokeBorder(.primary.opacity(0.13), lineWidth: 0.5)
         )
+        .opacity(presentationState.isContentVisible ? 1 : 0)
+        .allowsHitTesting(presentationState.isContentVisible)
+        .accessibilityHidden(!presentationState.isContentVisible)
         .animation(interfaceAnimation, value: isProcessing)
-        .animation(interfaceAnimation, value: isShowingStatusFeedback)
+        .animation(interfaceAnimation, value: isShowingFailureFeedback)
         .animation(interfaceAnimation, value: isShowingSmartPreview)
         .onAppear {
             initializeFlow(forceDefault: true)
@@ -273,13 +292,13 @@ struct QuickEntryContentView: View {
                     dismissSmartPreview()
                 }
                 .buttonStyle(.bordered)
-                .disabled(isProcessing)
+                .disabled(isProcessing || isCompletingCapture)
 
                 Button("Save") {
                     saveSmartPreview()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isProcessing || !previewCanSave)
+                .disabled(isProcessing || isCompletingCapture || !previewCanSave)
             }
 
             HStack(spacing: 12) {
@@ -477,6 +496,7 @@ struct QuickEntryContentView: View {
         .accessibilityLabel("Capture mode")
         .accessibilityValue(modeDisplayName)
         .help(modeTitle)
+        .disabled(isProcessing || isCompletingCapture)
     }
 
     @ViewBuilder
@@ -511,7 +531,7 @@ struct QuickEntryContentView: View {
         }
         .font(.system(size: 18, weight: .regular))
         .frame(maxWidth: .infinity)
-        .disabled(isProcessing)
+        .disabled(isProcessing || isCompletingCapture)
         .onKeyPress(keys: [.tab], phases: .down) { keyPress in
             guard !isShowingSmartPreview else { return .ignored }
             var transaction = Transaction(animation: nil)
@@ -531,13 +551,10 @@ struct QuickEntryContentView: View {
                     .controlSize(.small)
                     .frame(width: 34, height: 34)
                     .transition(.opacity.combined(with: .scale))
-            } else if isShowingStatusFeedback {
-                Label(
-                    statusText,
-                    systemImage: statusText.lowercased().contains("fail") ? "exclamationmark.circle.fill" : "checkmark.circle.fill"
-                )
+            } else if isShowingFailureFeedback {
+                Label(statusText, systemImage: "exclamationmark.circle.fill")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(statusText.lowercased().contains("fail") ? Color.red : Color.green)
+                    .foregroundStyle(Color.red)
                     .lineLimit(1)
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
             } else {
@@ -621,6 +638,7 @@ struct QuickEntryContentView: View {
     }
 
     private func initializeFlow(forceDefault: Bool) {
+        isCompletingCapture = false
         smartPreview = nil
         updateQuickEntryPanelSize(animated: false)
 
@@ -737,7 +755,7 @@ struct QuickEntryContentView: View {
     }
 
     private func advanceOrSave() {
-        guard currentField != nil, canAdvance else { return }
+        guard !isProcessing, !isCompletingCapture, currentField != nil, canAdvance else { return }
         payloadBuffer[currentFieldIndex].value = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if selectedMode != .smart, currentFieldIndex < payloadBuffer.count - 1 {
@@ -820,7 +838,7 @@ struct QuickEntryContentView: View {
     }
 
     private func saveSmartPreview() {
-        guard let preview = smartPreview else { return }
+        guard !isProcessing, !isCompletingCapture, let preview = smartPreview else { return }
 
         let encryptionMode = ProtectionService.shared.desiredEncryptionModeForNewShard()
         if encryptionMode == .global, ProtectionService.shared.requiresGlobalUnlock {
@@ -864,25 +882,13 @@ struct QuickEntryContentView: View {
                 encryptionMode: encryptionMode
             )
 
-            statusText = "Saved!"
             isProcessing = false
-            completeAndDismissPanel()
+            isCompletingCapture = true
+            actions.captureCompleted()
 
         } catch {
             statusText = "Save failed"
             isProcessing = false
-        }
-    }
-
-    private func dismissPanel() {
-        (NSApp.delegate as? AppDelegate)?.dismissQuickEntryPanel()
-    }
-
-    private func completeAndDismissPanel() {
-        DispatchQueue.main.async {
-            guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
-            appDelegate.completeQuickEntryPanel()
-            appDelegate.showToast(message: "Shard saved")
         }
     }
 
