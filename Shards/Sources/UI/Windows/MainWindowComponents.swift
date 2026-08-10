@@ -102,6 +102,21 @@ struct ShardListRow: View {
             }
         }
         .padding(.vertical, isCompact ? 2 : 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(accessibilitySummary)
+    }
+
+    private var accessibilitySummary: String {
+        var parts = [modeName]
+        if !contentPreview.isEmpty { parts.append(contentPreview) }
+        if isPinned { parts.append("Pinned") }
+        if isLocked { parts.append("Editing locked") }
+        if isProtected { parts.append("Protected") }
+        if isDeleted { parts.append("In Trash") }
+        if !tags.isEmpty { parts.append("Tags: \(tags.map(\.name).joined(separator: ", "))") }
+        parts.append("Edited \(dateString)")
+        return parts.joined(separator: ". ")
     }
 
     private var adaptiveTagSummary: some View {
@@ -136,6 +151,143 @@ struct ShardListRow: View {
             }
         }
         .foregroundStyle(Color(hex: tag.colorHex) ?? .secondary)
+    }
+}
+
+struct BatchShardSelectionView: View {
+    let selectedCount: Int
+    let lockedCount: Int
+    let isTrash: Bool
+    let hasEditableSelection: Bool
+    let shouldPin: Bool
+    let addableTags: [Tag]
+    let removableTags: [Tag]
+    let accentColor: Color
+    let onAddTag: (Tag) -> Void
+    let onRemoveTag: (Tag) -> Void
+    let onSetPinned: (Bool) -> Void
+    let onTrash: () -> Void
+    let onRestore: () -> Void
+    let onDelete: () -> Void
+    let onClearSelection: () -> Void
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Image(systemName: "square.stack.3d.up.fill")
+                .font(.system(size: 42, weight: .medium))
+                .foregroundStyle(accentColor)
+                .symbolRenderingMode(.hierarchical)
+
+            VStack(spacing: 6) {
+                Text("\(selectedCount) Shards Selected")
+                    .font(.title2.weight(.semibold))
+                Text("Drag the selection onto a tag or Trash, or use the actions below.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                if lockedCount > 0, !isTrash {
+                    Label(
+                        "\(lockedCount) locked \(lockedCount == 1 ? "shard" : "shards") will be skipped",
+                        systemImage: "lock.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                tagMenu
+
+                if isTrash {
+                    Button(action: onRestore) {
+                        Label("Restore", systemImage: "arrow.uturn.backward")
+                    }
+                    Button(role: .destructive, action: onDelete) {
+                        Label("Delete", systemImage: "trash.slash")
+                    }
+                } else {
+                    Button { onSetPinned(shouldPin) } label: {
+                        Label(shouldPin ? "Pin" : "Unpin", systemImage: shouldPin ? "pin" : "pin.slash")
+                    }
+                    .disabled(!hasEditableSelection)
+                    Button(role: .destructive, action: onTrash) {
+                        Label("Trash", systemImage: "trash")
+                    }
+                    .disabled(!hasEditableSelection)
+                }
+
+                Button("Clear Selection", action: onClearSelection)
+            }
+            .buttonStyle(.bordered)
+
+            Text("Categories are intentionally unchanged because a shard’s fields must continue to match its template schema.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 460)
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.clear)
+    }
+
+    private var tagMenu: some View {
+        Menu {
+            if addableTags.isEmpty {
+                Text("Every selected shard already has each available tag")
+            } else {
+                ForEach(addableTags) { tag in
+                    Button { onAddTag(tag) } label: {
+                        Label(tag.name, systemImage: tag.symbol)
+                    }
+                }
+            }
+
+            if !removableTags.isEmpty {
+                Divider()
+                Menu("Remove Tag") {
+                    ForEach(removableTags) { tag in
+                        Button { onRemoveTag(tag) } label: {
+                            Label(tag.name, systemImage: "tag.slash")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("Tags", systemImage: "tag")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(!hasEditableSelection)
+    }
+}
+
+private struct ShardDropTargetModifier: ViewModifier {
+    let accentColor: Color
+    let onDrop: ([ShardDragPayload]) -> Bool
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(accentColor.opacity(isTargeted ? 0.14 : 0))
+            }
+            .dropDestination(for: ShardDragPayload.self) { payloads, _ in
+                onDrop(payloads)
+            } isTargeted: { targeted in
+                withAnimation(.easeOut(duration: 0.12)) {
+                    isTargeted = targeted
+                }
+            }
+    }
+}
+
+extension View {
+    func shardDropTarget(
+        accentColor: Color,
+        onDrop: @escaping ([ShardDragPayload]) -> Bool
+    ) -> some View {
+        modifier(ShardDropTargetModifier(accentColor: accentColor, onDrop: onDrop))
     }
 }
 

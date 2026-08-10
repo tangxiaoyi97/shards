@@ -36,6 +36,8 @@
 		A10000000000000000000008 /* MainWindowComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* MainWindowComponents.swift */; };
 		A10000000000000000000009 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D10000000000000000000001 /* Sparkle */; };
 		A10000000000000000000010 /* AppBuildInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* AppBuildInfo.swift */; };
+		A10000000000000000000011 /* ShardBatchService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* ShardBatchService.swift */; };
+		A10000000000000000000012 /* RecentCaptureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* RecentCaptureStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -79,6 +81,8 @@
 		B10000000000000000000008 /* MainWindowComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowComponents.swift; sourceTree = "<group>"; };
 		B10000000000000000000010 /* AppBuildInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppBuildInfo.swift; sourceTree = "<group>"; };
 		B10000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B10000000000000000000012 /* ShardBatchService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShardBatchService.swift; sourceTree = "<group>"; };
+		B10000000000000000000013 /* RecentCaptureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecentCaptureStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -191,6 +195,8 @@
 				B10000000000000000000010 /* AppBuildInfo.swift */,
 				226927F9AC4C23EE5F747EB1 /* AppSettings.swift */,
 				F012ABDCFF99053A65A698C8 /* ProtectionService.swift */,
+				B10000000000000000000013 /* RecentCaptureStore.swift */,
+				B10000000000000000000012 /* ShardBatchService.swift */,
 				B55D6DF77A2C82CA8CBF7416 /* ShardExportService.swift */,
 				354E168CA744F0C1CD2F09ED /* SmartInputService.swift */,
 				B10000000000000000000004 /* UpdateController.swift */,
@@ -371,6 +377,7 @@
 			files = (
 				A10000000000000000000001 /* AppAppearance.swift in Sources */,
 				A10000000000000000000010 /* AppBuildInfo.swift in Sources */,
+				A10000000000000000000012 /* RecentCaptureStore.swift in Sources */,
 				982B1AD2E40749576B704D90 /* AppBackgroundView.swift in Sources */,
 				F3B84E77685EA1C06A96D908 /* AppDelegate.swift in Sources */,
 				068E8FE6D9C02E4D98A9FFEF /* AppSettings.swift in Sources */,
@@ -386,6 +393,7 @@
 				A10000000000000000000007 /* DiagnosticsSettingsView.swift in Sources */,
 				A10000000000000000000005 /* SettingsComponents.swift in Sources */,
 				13B0D259C266E1B90842FB41 /* ShardExportService.swift in Sources */,
+				A10000000000000000000011 /* ShardBatchService.swift in Sources */,
 				4E9CBC381DA9CDCFFC0ADF91 /* ShardsApp.swift in Sources */,
 				AAABCA472B89FA78EA0F2CFD /* SmartInputService.swift in Sources */,
 				A10000000000000000000004 /* UpdateController.swift in Sources */,
@@ -549,7 +557,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Shards/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -557,7 +565,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tangxiaoyi.Shards;
 				SDKROOT = macosx;
 				SWIFT_STRICT_CONCURRENCY = complete;
@@ -570,7 +578,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Shards/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -578,7 +586,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tangxiaoyi.Shards;
 				SDKROOT = macosx;
 				SWIFT_STRICT_CONCURRENCY = complete;

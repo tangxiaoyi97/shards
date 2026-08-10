@@ -160,7 +160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshQuickEntryPanelContent(_ panel: QuickEntryPanel? = nil) {
         guard let targetPanel = panel ?? quickEntryPanel else { return }
         let container = VaultContainer.shared.container
-        let actions = QuickEntryActions(captureCompleted: { [weak self] in
+        let actions = QuickEntryActions(captureCompleted: { [weak self] shard in
+            RecentCaptureStore.shared.record(shardID: shard.id)
             self?.completeQuickEntryPanel()
         })
         let hosting = TransparentHostingView(
@@ -212,6 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quickEntryItem = menu.addItem(withTitle: "Quick Entry", action: #selector(showQuickEntryPanel), keyEquivalent: "S")
         quickEntryItem.keyEquivalentModifierMask = [.command, .shift]
 
+        if resolvedRecentCapture() != nil {
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Open Last Capture", action: #selector(openRecentCapture), keyEquivalent: "")
+            menu.addItem(withTitle: "Undo Last Capture", action: #selector(undoRecentCapture), keyEquivalent: "")
+        }
+
+        menu.addItem(.separator())
         let settingsItem = menu.addItem(withTitle: "Settings…", action: #selector(openSettingsUI), keyEquivalent: ",")
         settingsItem.keyEquivalentModifierMask = [.command]
 
@@ -249,12 +257,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             })?.id ?? VaultContainer.Defaults.allCollectionID
             let tagIds = resolveStatusBarDoubleClickTagIDs(from: tags)
 
-            try VaultRepository.shared.saveRawText(
+            let shard = try VaultRepository.shared.saveRawText(
                 text,
                 collectionId: shardsCollectionId,
                 tagIds: tagIds,
                 encryptionMode: encryptionMode
             )
+            RecentCaptureStore.shared.record(shardID: shard.id)
             flashStatusBarIcon(success: true)
         } catch {
             flashStatusBarIcon(success: false)
@@ -303,6 +312,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc
     private func showQuickEntryPanel() {
         toggleQuickEntryPanel(forceVisible: true)
+    }
+
+    @objc
+    private func openRecentCapture() {
+        guard let shard = resolvedRecentCapture() else { return }
+        openVaultUI()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .openShardRequested, object: shard.id)
+        }
+    }
+
+    @objc
+    private func undoRecentCapture() {
+        guard let shard = resolvedRecentCapture() else { return }
+        do {
+            let context = VaultContainer.shared.container.mainContext
+            let tags = try context.fetch(FetchDescriptor<Tag>())
+            let lockedTagID = tags.first(where: { $0.name == "Locked" })?.id
+            let receipt = try VaultRepository.shared.applyBatchInIsolatedContext(
+                .moveToTrash,
+                to: [shard.id],
+                lockedTagID: lockedTagID
+            )
+            if receipt.changedCount > 0 {
+                RecentCaptureStore.shared.clear(ifMatching: shard.id)
+            } else if !receipt.skippedLockedIDs.isEmpty {
+                showToast(message: "Unlock the shard before undoing this capture")
+            }
+        } catch {
+            showToast(message: "Could not undo the last capture")
+        }
+    }
+
+    private func resolvedRecentCapture() -> Shard? {
+        guard let shardID = RecentCaptureStore.shared.shardID,
+              let shard = try? VaultRepository.shared.shard(withID: shardID),
+              shard.deletedAt == nil
+        else {
+            if RecentCaptureStore.shared.shardID != nil {
+                RecentCaptureStore.shared.clear()
+            }
+            return nil
+        }
+        return shard
     }
 
     @objc
@@ -476,8 +529,8 @@ private struct ToastView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
             Text(message)
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .lineLimit(2)

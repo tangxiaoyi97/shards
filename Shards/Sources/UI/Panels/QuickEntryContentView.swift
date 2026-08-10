@@ -41,7 +41,7 @@ extension Notification.Name {
 }
 
 struct QuickEntryActions {
-    let captureCompleted: @MainActor () -> Void
+    let captureCompleted: @MainActor (Shard) -> Void
 }
 
 struct QuickEntryContentView: View {
@@ -875,7 +875,7 @@ struct QuickEntryContentView: View {
             ?? VaultContainer.Defaults.allCollectionID
 
         do {
-            _ = try VaultRepository.shared.save(
+            let shard = try VaultRepository.shared.save(
                 payload: payload,
                 collectionId: collectionId,
                 tagIds: [],
@@ -884,7 +884,7 @@ struct QuickEntryContentView: View {
 
             isProcessing = false
             isCompletingCapture = true
-            actions.captureCompleted()
+            actions.captureCompleted(shard)
 
         } catch {
             statusText = "Save failed"

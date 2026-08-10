@@ -1,3 +1,4 @@
+import CoreTransferable
 import SwiftData
 import SwiftUI
 import UniformTypeIdentifiers
@@ -12,6 +13,42 @@ private enum VaultFilter: Hashable {
     case trash
 }
 
+extension UTType {
+    static let shardSelection = UTType(exportedAs: "com.tangxiaoyi.Shards.shard-selection")
+}
+
+struct ShardDragPayload: Codable, Hashable, Sendable, Transferable {
+    let shardIDs: [String]
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .shardSelection)
+    }
+
+    static func normalizedIDs(from payloads: [ShardDragPayload]) -> [String] {
+        var seen = Set<String>()
+        return payloads.flatMap(\.shardIDs).filter { seen.insert($0).inserted }
+    }
+}
+
+enum ShardSelectionPolicy {
+    static func reconciled(
+        current: Set<String>,
+        visibleIDs: [String],
+        preserveHiddenSingleSelection: Bool
+    ) -> Set<String> {
+        if preserveHiddenSingleSelection { return current }
+        let retained = current.intersection(visibleIDs)
+        if !retained.isEmpty { return retained }
+        return visibleIDs.first.map { [$0] } ?? []
+    }
+}
+
+private struct VaultOperationAlert: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+}
+
 // MARK: - Main Window
 
 struct MainWindow: View {
@@ -19,6 +56,7 @@ struct MainWindow: View {
 
     @Environment(\.modelContext) private var context
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.undoManager) private var undoManager
     @Query(sort: \Shard.createdAt, order: .reverse) private var shards: [Shard]
     @Query(sort: \ShardCollection.createdAt, order: .forward) private var collections: [ShardCollection]
     @Query(sort: \Tag.name, order: .forward) private var tags: [Tag]
@@ -29,7 +67,7 @@ struct MainWindow: View {
 
     @State private var searchText = ""
     @State private var activeFilter: VaultFilter = .shards
-    @State private var selectedShardId: String?
+    @State private var selectedShardIDs: Set<String> = []
     @State private var isHeaderCollapsed = false
     @State private var isTagPopoverPresented = false
     @State private var isEditorFocused = false
@@ -41,7 +79,14 @@ struct MainWindow: View {
 
     // Save state
     @State private var isDirty = false
+    @State private var dirtyShardID: String?
     @State private var saveDebounceTask: Task<Void, Never>?
+    @State private var batchUndoController = VaultBatchUndoController()
+    @State private var operationAlert: VaultOperationAlert?
+    @State private var operationNotice: String?
+    @State private var operationNoticeTask: Task<Void, Never>?
+    @State private var pendingPermanentDeleteIDs: Set<String> = []
+    @State private var recentCaptureID: String?
     @State private var showUnlockAlert = false
     @State private var isWindowActive = true
     @State private var protectionPrompt: ProtectionPrompt?
@@ -60,10 +105,19 @@ struct MainWindow: View {
     private let systemHiddenTagName = "Hidden"
     private let lockedTagName = "Locked"
 
+    private var selectedShards: [Shard] {
+        filteredShards.filter { selectedShardIDs.contains($0.id) }
+    }
+
     private var selectedShard: Shard? {
-        guard let selectedShardId else { return nil }
-        return filteredShards.first(where: { $0.id == selectedShardId })
-            ?? shards.first(where: { $0.id == selectedShardId })
+        guard selectedShardIDs.count == 1, let selectedShardID = selectedShardIDs.first else { return nil }
+        return filteredShards.first(where: { $0.id == selectedShardID })
+            ?? shards.first(where: { $0.id == selectedShardID })
+    }
+
+    private var recentCaptureShard: Shard? {
+        guard let recentCaptureID else { return nil }
+        return shards.first(where: { $0.id == recentCaptureID && $0.deletedAt == nil })
     }
 
     private var isSelectedShardLocked: Bool {
@@ -144,10 +198,10 @@ struct MainWindow: View {
     }
 
     private var selectedShardShouldPersistWhenHidden: Bool {
-        guard let selectedShardId else { return false }
+        guard selectedShardIDs.count == 1, let selectedShardID = selectedShardIDs.first else { return false }
         guard !keyboardMonitor.isOptionPressed else { return false }
         guard let hiddenTagID = tags.first(where: { $0.name == systemHiddenTagName })?.id else { return false }
-        return shards.contains(where: { $0.id == selectedShardId && $0.tagIds.contains(hiddenTagID) })
+        return shards.contains(where: { $0.id == selectedShardID && $0.tagIds.contains(hiddenTagID) })
     }
 
     // MARK: - Body
@@ -193,16 +247,15 @@ struct MainWindow: View {
                     .keyboardShortcut("s", modifiers: .command)
                 Button("Pin") { if let shard = selectedShard { togglePin(shard) } }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
-                Button("Delete") { if let shard = selectedShard { softDelete(shard) } }
-                    .keyboardShortcut(.delete, modifiers: .command)
             }
             .frame(width: 0, height: 0)
             .opacity(0)
             .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
         .overlay(alignment: .top) {
-            if let startupIssue = VaultContainer.shared.startupIssue {
-                Text(startupIssue)
+            if let message = operationNotice ?? VaultContainer.shared.startupIssue {
+                Text(message)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 14)
@@ -212,20 +265,39 @@ struct MainWindow: View {
             }
         }
         .onChange(of: filteredShards.map(\.id)) { _, ids in
-            guard let first = ids.first else {
-                if !selectedShardShouldPersistWhenHidden {
-                    selectedShardId = nil
-                }
-                return
+            let reconciled = ShardSelectionPolicy.reconciled(
+                current: selectedShardIDs,
+                visibleIDs: ids,
+                preserveHiddenSingleSelection: selectedShardShouldPersistWhenHidden
+            )
+            if reconciled != selectedShardIDs {
+                selectedShardIDs = reconciled
             }
-            if selectedShardShouldPersistWhenHidden {
-                return
+        }
+        .onChange(of: selectedShardIDs) { _, selection in
+            if selection.count != 1, isEditorFocused {
+                isEditorFocused = false
             }
-            if selectedShardId == nil || !ids.contains(selectedShardId ?? "") {
-                withAnimation(.spring(duration: 0.3)) {
-                    selectedShardId = first
-                }
+        }
+        .onAppear {
+            recentCaptureID = RecentCaptureStore.shared.shardID
+            batchUndoController.onError = { message in
+                operationAlert = VaultOperationAlert(title: "Unable to Undo", message: message)
             }
+            batchUndoController.prepareForReplay = {
+                persistPendingEdits()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .recentCaptureDidChange)) { _ in
+            recentCaptureID = RecentCaptureStore.shared.shardID
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openShardRequested)) { notification in
+            guard let shardID = notification.object as? String,
+                  let shard = shards.first(where: { $0.id == shardID })
+            else { return }
+            searchText = ""
+            activeFilter = shard.deletedAt == nil ? .shards : .trash
+            selectedShardIDs = [shardID]
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             withAnimation(.easeInOut(duration: 0.25)) { isWindowActive = false }
@@ -244,6 +316,30 @@ struct MainWindow: View {
                 onSubmit: { handleProtectionPrompt(prompt) }
             )
         }
+        .alert(item: $operationAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+        .confirmationDialog(
+            pendingPermanentDeleteIDs.count == 1 ? "Delete Shard Permanently?" : "Delete \(pendingPermanentDeleteIDs.count) Shards Permanently?",
+            isPresented: Binding(
+                get: { !pendingPermanentDeleteIDs.isEmpty },
+                set: { if !$0 { pendingPermanentDeleteIDs = [] } }
+            )
+        ) {
+            Button("Delete Permanently", role: .destructive) {
+                permanentlyDelete(Array(pendingPermanentDeleteIDs))
+                pendingPermanentDeleteIDs = []
+            }
+            Button("Cancel", role: .cancel) {
+                pendingPermanentDeleteIDs = []
+            }
+        } message: {
+            Text("This cannot be undone.")
+        }
     }
 
     private var splitView: some View {
@@ -255,6 +351,18 @@ struct MainWindow: View {
                 .navigationTitle(filterTitle)
                 .toolbar {
                     if !isEditorFocused {
+                        if recentCaptureShard != nil {
+                            ToolbarItem(placement: .secondaryAction) {
+                                Menu {
+                                    Button("Open Last Capture", action: openRecentCapture)
+                                    Button("Undo Last Capture", role: .destructive, action: undoRecentCapture)
+                                } label: {
+                                    Label("Recent Capture", systemImage: "clock.arrow.circlepath")
+                                }
+                                .help("Recent capture actions")
+                            }
+                        }
+
                         ToolbarItem(placement: .primaryAction) {
                             Button(action: createNewShard) {
                                 Image(systemName: "square.and.pencil")
@@ -314,6 +422,9 @@ private extension MainWindow {
                     filter: .trash,
                     count: shards.filter { $0.deletedAt != nil }.count
                 )
+                .shardDropTarget(accentColor: appAccentColor) { payloads in
+                    handleDrop(payloads, operation: .moveToTrash)
+                }
             }
 
             let pinned = filteredVisibleSidebarShards.filter { $0.isPinned }
@@ -358,6 +469,9 @@ private extension MainWindow {
                             count: count,
                             tintColor: Color(hex: tag.colorHex)
                         )
+                        .shardDropTarget(accentColor: Color(hex: tag.colorHex) ?? appAccentColor) { payloads in
+                            handleDrop(payloads, operation: .addTag(tag.id))
+                        }
                     }
                 } header: {
                     Text("Tags")
@@ -367,6 +481,7 @@ private extension MainWindow {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .background(.clear)
+        .onDeleteCommand(perform: moveSelectionToTrash)
         .tint(appAccentColor)
     }
 
@@ -379,6 +494,8 @@ private extension MainWindow {
                 .symbolRenderingMode(.hierarchical)
         }
         .badge(count > 0 ? count : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .tag(filter)
     }
 }
@@ -387,7 +504,7 @@ private extension MainWindow {
 
 private extension MainWindow {
     var shardListContent: some View {
-        List(selection: $selectedShardId) {
+        List(selection: $selectedShardIDs) {
             ForEach(filteredShards) { shard in
                 ShardListRow(
                     title: title(for: shard),
@@ -404,7 +521,16 @@ private extension MainWindow {
                     contentPreview: contentPreview(for: shard)
                 )
                 .tag(shard.id)
-                .contextMenu { shardContextMenu(for: shard) }
+                .draggable(dragPayload(for: shard)) {
+                    dragPreview(for: shard)
+                }
+                .contextMenu {
+                    if selectedShardIDs.count > 1, selectedShardIDs.contains(shard.id) {
+                        batchContextMenu
+                    } else {
+                        shardContextMenu(for: shard)
+                    }
+                }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     leadingSwipeActions(for: shard)
                 }
@@ -416,6 +542,28 @@ private extension MainWindow {
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
         .background(.clear)
+    }
+
+    func dragPayload(for shard: Shard) -> ShardDragPayload {
+        if selectedShardIDs.contains(shard.id) {
+            let orderedIDs = filteredShards
+                .filter { selectedShardIDs.contains($0.id) }
+                .map(\.id)
+            return ShardDragPayload(shardIDs: orderedIDs)
+        }
+        return ShardDragPayload(shardIDs: [shard.id])
+    }
+
+    func dragPreview(for shard: Shard) -> some View {
+        let payload = dragPayload(for: shard)
+        return Label(
+            payload.shardIDs.count == 1 ? title(for: shard) : "\(payload.shardIDs.count) Shards",
+            systemImage: payload.shardIDs.count == 1 ? iconName(for: shard) : "square.stack.3d.up.fill"
+        )
+        .font(.callout.weight(.medium))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     func contentPreview(for shard: Shard) -> String {
@@ -452,7 +600,9 @@ private extension MainWindow {
 private extension MainWindow {
     @ViewBuilder
     var detailContent: some View {
-        if let shard = selectedShard {
+        if selectedShards.count > 1 {
+            batchSelectionView
+        } else if let shard = selectedShard {
             let isHidden = tags.first(where: { $0.name == systemHiddenTagName }).map { shard.tagIds.contains($0.id) } ?? false
             ZStack(alignment: .bottom) {
                 VStack(spacing: 0) {
@@ -488,6 +638,42 @@ private extension MainWindow {
             }
         } else {
             emptyStateView
+        }
+    }
+
+    var batchSelectionView: some View {
+        let selected = selectedShards
+        let selectedIDs = selected.map(\.id)
+        return BatchShardSelectionView(
+            selectedCount: selected.count,
+            lockedCount: selected.filter(shardIsLocked).count,
+            isTrash: activeFilter == .trash,
+            hasEditableSelection: selected.contains(where: { !shardIsLocked($0) }),
+            shouldPin: !selected.filter { !shardIsLocked($0) }.allSatisfy(\.isPinned),
+            addableTags: addableTagsForSelection,
+            removableTags: removableTagsForSelection,
+            accentColor: appAccentColor,
+            onAddTag: { applyBatch(.addTag($0.id), to: selectedIDs) },
+            onRemoveTag: { applyBatch(.removeTag($0.id), to: selectedIDs) },
+            onSetPinned: { applyBatch(.setPinned($0), to: selectedIDs) },
+            onTrash: { applyBatch(.moveToTrash, to: selectedIDs) },
+            onRestore: { applyBatch(.restore, to: selectedIDs) },
+            onDelete: { requestPermanentDelete(selectedIDs) },
+            onClearSelection: { selectedShardIDs = [] }
+        )
+    }
+
+    var addableTagsForSelection: [Tag] {
+        let selected = selectedShards.filter { !shardIsLocked($0) }
+        return assignableTags.filter { tag in
+            selected.contains(where: { !$0.tagIds.contains(tag.id) })
+        }
+    }
+
+    var removableTagsForSelection: [Tag] {
+        let selected = selectedShards.filter { !shardIsLocked($0) }
+        return assignableTags.filter { tag in
+            selected.contains(where: { $0.tagIds.contains(tag.id) })
         }
     }
 
@@ -899,7 +1085,7 @@ private extension MainWindow {
             Button(action: { recover(shard) }) {
                 Label("Recover", systemImage: "arrow.uturn.backward")
             }
-            Button(role: .destructive, action: { permanentDelete(shard) }) {
+            Button(role: .destructive, action: { requestPermanentDelete([shard.id]) }) {
                 Label("Delete Permanently", systemImage: "xmark.bin")
             }
         } else {
@@ -974,6 +1160,65 @@ private extension MainWindow {
     }
 
     @ViewBuilder
+    var batchContextMenu: some View {
+        let selected = selectedShards
+        let selectedIDs = selected.map(\.id)
+        let editableSelection = selected.filter { !shardIsLocked($0) }
+
+        if activeFilter == .trash {
+            Button {
+                applyBatch(.restore, to: selectedIDs)
+            } label: {
+                Label("Restore \(selected.count) Shards", systemImage: "arrow.uturn.backward")
+            }
+            Button(role: .destructive) {
+                requestPermanentDelete(selectedIDs)
+            } label: {
+                Label("Delete Permanently…", systemImage: "xmark.bin")
+            }
+        } else {
+            let shouldPin = !editableSelection.allSatisfy(\.isPinned)
+            Button {
+                applyBatch(.setPinned(shouldPin), to: selectedIDs)
+            } label: {
+                Label(shouldPin ? "Pin Selection" : "Unpin Selection", systemImage: shouldPin ? "pin" : "pin.slash")
+            }
+            .disabled(editableSelection.isEmpty)
+
+            Menu("Add Tag") {
+                ForEach(addableTagsForSelection) { tag in
+                    Button {
+                        applyBatch(.addTag(tag.id), to: selectedIDs)
+                    } label: {
+                        Label(tag.name, systemImage: tag.symbol)
+                    }
+                }
+            }
+            .disabled(editableSelection.isEmpty || addableTagsForSelection.isEmpty)
+
+            if !removableTagsForSelection.isEmpty {
+                Menu("Remove Tag") {
+                    ForEach(removableTagsForSelection) { tag in
+                        Button {
+                            applyBatch(.removeTag(tag.id), to: selectedIDs)
+                        } label: {
+                            Label(tag.name, systemImage: "tag.slash")
+                        }
+                    }
+                }
+            }
+
+            Divider()
+            Button(role: .destructive) {
+                applyBatch(.moveToTrash, to: selectedIDs)
+            } label: {
+                Label("Move Selection to Trash", systemImage: "trash")
+            }
+            .disabled(editableSelection.isEmpty)
+        }
+    }
+
+    @ViewBuilder
     func leadingSwipeActions(for shard: Shard) -> some View {
         if shard.deletedAt == nil {
             Button(action: { togglePin(shard) }) {
@@ -995,7 +1240,7 @@ private extension MainWindow {
                 Label("Trash", systemImage: "trash")
             }
         } else {
-            Button(role: .destructive, action: { permanentDelete(shard) }) {
+            Button(role: .destructive, action: { requestPermanentDelete([shard.id]) }) {
                 Label("Delete", systemImage: "xmark.bin")
             }
         }
@@ -1186,69 +1431,222 @@ private extension MainWindow {
 
     func markDirty(for shard: Shard) {
         isDirty = true
+        dirtyShardID = shard.id
         saveDebounceTask?.cancel()
         saveDebounceTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled else { return }
-            shard.updatedAt = Date()
-            try? context.save()
-            isDirty = false
+            _ = persistPendingEdits()
         }
     }
 
     func saveCurrentShard() {
+        _ = persistPendingEdits()
+    }
+
+    @discardableResult
+    func persistPendingEdits() -> Bool {
         saveDebounceTask?.cancel()
-        guard let shard = selectedShard else { return }
-        shard.updatedAt = Date()
-        try? context.save()
-        isDirty = false
+        saveDebounceTask = nil
+
+        if let dirtyShardID,
+           let shard = shards.first(where: { $0.id == dirtyShardID }) {
+            shard.updatedAt = Date()
+        }
+
+        guard context.hasChanges else {
+            isDirty = false
+            dirtyShardID = nil
+            return true
+        }
+
+        do {
+            try context.save()
+            isDirty = false
+            dirtyShardID = nil
+            return true
+        } catch {
+            isDirty = true
+            operationAlert = VaultOperationAlert(
+                title: "Unable to Save",
+                message: "Your changes remain open so you can retry. \(error.localizedDescription)"
+            )
+            return false
+        }
     }
 
     // MARK: Actions
 
     func togglePin(_ shard: Shard) {
-        withAnimation(.snappy(duration: 0.25)) {
-            shard.isPinned.toggle()
-            shard.updatedAt = Date()
-            try? context.save()
-        }
+        applyBatch(.setPinned(!shard.isPinned), to: [shard.id])
     }
 
     func toggleTag(_ tag: Tag, on shard: Shard) {
-        withAnimation(.snappy(duration: 0.2)) {
-            if shard.tagIds.contains(tag.id) {
-                shard.tagIds.removeAll(where: { $0 == tag.id })
-            } else {
-                shard.tagIds.append(tag.id)
-            }
-            shard.updatedAt = Date()
-            try? context.save()
-        }
+        let operation: ShardBatchOperation = shard.tagIds.contains(tag.id)
+            ? .removeTag(tag.id)
+            : .addTag(tag.id)
+        applyBatch(operation, to: [shard.id])
     }
 
     func removeTag(_ tag: Tag, from shard: Shard) {
         guard shard.tagIds.contains(tag.id) else { return }
-        withAnimation(.snappy(duration: 0.2)) {
-            shard.tagIds.removeAll(where: { $0 == tag.id })
-            shard.updatedAt = Date()
-            try? context.save()
+        applyBatch(.removeTag(tag.id), to: [shard.id])
+    }
+
+    @discardableResult
+    func applyBatch(
+        _ operation: ShardBatchOperation,
+        to shardIDs: [String]
+    ) -> ShardBatchReceipt? {
+        guard !shardIDs.isEmpty, persistPendingEdits() else { return nil }
+
+        do {
+            let receipt = try VaultRepository.shared.applyBatch(
+                operation,
+                to: shardIDs,
+                lockedTagID: tags.first(where: { $0.name == lockedTagName })?.id
+            )
+
+            batchUndoController.register(
+                receipt,
+                with: undoManager,
+                repository: VaultRepository.shared
+            )
+
+            if operation == .moveToTrash || operation == .restore {
+                withAnimation(.snappy(duration: reduceMotion ? 0 : 0.22)) {
+                    selectedShardIDs.subtract(receipt.changedIDs)
+                }
+            }
+
+            var skippedMessages: [String] = []
+            if !receipt.skippedLockedIDs.isEmpty {
+                skippedMessages.append("\(receipt.skippedLockedIDs.count) locked")
+            }
+            if !receipt.missingIDs.isEmpty {
+                skippedMessages.append("\(receipt.missingIDs.count) unavailable")
+            }
+            if !skippedMessages.isEmpty {
+                showOperationNotice("Skipped " + skippedMessages.joined(separator: " and "))
+            } else if receipt.changes.isEmpty {
+                showOperationNotice("No changes needed")
+            }
+
+            return receipt
+        } catch {
+            operationAlert = VaultOperationAlert(title: "Unable to Update Shards", message: error.localizedDescription)
+            return nil
+        }
+    }
+
+    func handleDrop(
+        _ payloads: [ShardDragPayload],
+        operation: ShardBatchOperation
+    ) -> Bool {
+        let shardIDs = ShardDragPayload.normalizedIDs(from: payloads)
+        return (applyBatch(operation, to: shardIDs)?.changedCount ?? 0) > 0
+    }
+
+    func moveSelectionToTrash() {
+        let shardIDs = selectedShardIDs.isEmpty ? selectedShard.map { [$0.id] } ?? [] : Array(selectedShardIDs)
+        if activeFilter == .trash {
+            requestPermanentDelete(shardIDs)
+        } else {
+            applyBatch(.moveToTrash, to: shardIDs)
+        }
+    }
+
+    func requestPermanentDelete(_ shardIDs: [String]) {
+        let eligibleIDs = Set(shardIDs.filter { id in
+            guard let shard = shards.first(where: { $0.id == id }) else { return false }
+            return shard.deletedAt != nil && !shardIsLocked(shard)
+        })
+
+        let skippedCount = Set(shardIDs).count - eligibleIDs.count
+        if skippedCount > 0 {
+            showOperationNotice("Skipped \(skippedCount) locked or unavailable \(skippedCount == 1 ? "shard" : "shards")")
+        }
+        pendingPermanentDeleteIDs = eligibleIDs
+    }
+
+    func permanentlyDelete(_ shardIDs: [String]) {
+        guard !shardIDs.isEmpty, persistPendingEdits() else { return }
+        do {
+            let receipt = try VaultRepository.shared.permanentlyDelete(
+                shardIDs: shardIDs,
+                lockedTagID: tags.first(where: { $0.name == lockedTagName })?.id
+            )
+            let idSet = Set(receipt.deletedIDs)
+            selectedShardIDs.subtract(idSet)
+            if let recentCaptureID, idSet.contains(recentCaptureID) {
+                RecentCaptureStore.shared.clear(ifMatching: recentCaptureID)
+            }
+            let skippedCount = receipt.skippedLockedIDs.count
+                + receipt.skippedLiveIDs.count
+                + receipt.missingIDs.count
+            if skippedCount > 0 {
+                showOperationNotice("Skipped \(skippedCount) unavailable \(skippedCount == 1 ? "shard" : "shards")")
+            }
+        } catch {
+            operationAlert = VaultOperationAlert(title: "Unable to Delete", message: error.localizedDescription)
+        }
+    }
+
+    func saveDirectChange(action: String) {
+        do {
+            try context.save()
+        } catch {
+            context.rollback()
+            operationAlert = VaultOperationAlert(title: "Unable to \(action)", message: error.localizedDescription)
+        }
+    }
+
+    func showOperationNotice(_ message: String) {
+        operationNoticeTask?.cancel()
+        operationNotice = message
+        operationNoticeTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            operationNotice = nil
+        }
+    }
+
+    func openRecentCapture() {
+        guard let shard = recentCaptureShard else {
+            RecentCaptureStore.shared.clear()
+            return
+        }
+        searchText = ""
+        activeFilter = .shards
+        selectedShardIDs = [shard.id]
+    }
+
+    func undoRecentCapture() {
+        guard let shard = recentCaptureShard else {
+            RecentCaptureStore.shared.clear()
+            return
+        }
+        if let receipt = applyBatch(.moveToTrash, to: [shard.id]), receipt.changedCount > 0 {
+            RecentCaptureStore.shared.clear(ifMatching: shard.id)
         }
     }
 
     func lock(_ shard: Shard) {
+        guard persistPendingEdits() else { return }
         guard let lockedTagId = tags.first(where: { $0.name == lockedTagName })?.id else { return }
         if !shard.tagIds.contains(lockedTagId) {
             shard.tagIds.append(lockedTagId)
             shard.updatedAt = Date()
-            try? context.save()
+            saveDirectChange(action: "Lock Shard")
         }
     }
 
     func unlock(_ shard: Shard) {
+        guard persistPendingEdits() else { return }
         guard let lockedTagId = tags.first(where: { $0.name == lockedTagName })?.id else { return }
         shard.tagIds.removeAll(where: { $0 == lockedTagId })
         shard.updatedAt = Date()
-        try? context.save()
+        saveDirectChange(action: "Unlock Shard")
     }
 
     func unlockCurrentShard() {
@@ -1311,12 +1709,12 @@ private extension MainWindow {
     func navigateToTag(_ tag: Tag, selectedShard shard: Shard) {
         withAnimation(.snappy(duration: 0.2)) {
             activeFilter = .tag(tag.id)
-            selectedShardId = shard.id
+            selectedShardIDs = [shard.id]
         }
     }
 
     func createTag(name: String, symbol: String, colorHex: String, on shard: Shard) {
-        guard !name.isEmpty else { return }
+        guard !name.isEmpty, persistPendingEdits() else { return }
         if let existingTag = assignableTags.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
             toggleTag(existingTag, on: shard)
         } else {
@@ -1324,7 +1722,7 @@ private extension MainWindow {
             context.insert(tag)
             shard.tagIds.append(tag.id)
             shard.updatedAt = Date()
-            try? context.save()
+            saveDirectChange(action: "Create Tag")
         }
     }
 
@@ -1336,7 +1734,7 @@ private extension MainWindow {
     }
 
     func duplicate(_ shard: Shard) {
-        guard let accessibleText = accessiblePayloadText(for: shard) else { return }
+        guard persistPendingEdits(), let accessibleText = accessiblePayloadText(for: shard) else { return }
         let newShard = Shard(
             collectionId: shard.collectionId,
             tagIds: shard.tagIds,
@@ -1352,36 +1750,25 @@ private extension MainWindow {
         )) ?? shard.payload
 
         context.insert(newShard)
-        try? context.save()
-        withAnimation(.snappy(duration: 0.2)) { selectedShardId = newShard.id }
+        do {
+            try context.save()
+            withAnimation(.snappy(duration: 0.2)) { selectedShardIDs = [newShard.id] }
+        } catch {
+            context.rollback()
+            operationAlert = VaultOperationAlert(title: "Unable to Duplicate", message: error.localizedDescription)
+        }
     }
 
     func softDelete(_ shard: Shard) {
-        guard !shardIsLocked(shard) else { return }
-        withAnimation(.snappy(duration: 0.25)) {
-            if selectedShardId == shard.id { selectedShardId = nil }
-            shard.deletedAt = Date()
-            try? context.save()
-        }
-    }
-
-    func permanentDelete(_ shard: Shard) {
-        guard !shardIsLocked(shard) else { return }
-        withAnimation(.snappy(duration: 0.25)) {
-            if selectedShardId == shard.id { selectedShardId = nil }
-            context.delete(shard)
-            try? context.save()
-        }
+        applyBatch(.moveToTrash, to: [shard.id])
     }
 
     func recover(_ shard: Shard) {
-        withAnimation(.snappy(duration: 0.25)) {
-            shard.deletedAt = nil
-            try? context.save()
-        }
+        applyBatch(.restore, to: [shard.id])
     }
 
     func createNewShard() {
+        guard persistPendingEdits() else { return }
         let mode = protection.desiredEncryptionModeForNewShard()
         if mode == .global, protection.requiresGlobalUnlock {
             globalUnlockMessage = "Unlock the vault before creating a new shard."
@@ -1401,8 +1788,13 @@ private extension MainWindow {
             payload: finalPayload
         )
         context.insert(shard)
-        try? context.save()
-        withAnimation(.snappy(duration: 0.2)) { selectedShardId = shard.id }
+        do {
+            try context.save()
+            withAnimation(.snappy(duration: 0.2)) { selectedShardIDs = [shard.id] }
+        } catch {
+            context.rollback()
+            operationAlert = VaultOperationAlert(title: "Unable to Create Shard", message: error.localizedDescription)
+        }
     }
 
     func plainTextDocument(for shard: Shard) -> String? {

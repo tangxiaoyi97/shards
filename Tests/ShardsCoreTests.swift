@@ -509,6 +509,286 @@ final class ShardsCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testBatchTagOperationSkipsLockedShardAndSupportsUndoRedo() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let tag = Tag(id: "work", name: "Work", colorHex: "#336699", symbol: "briefcase")
+        let lockedTag = Tag(id: "locked", name: "Locked", colorHex: "#666666", symbol: "lock.fill")
+        let editable = Shard(id: "editable", payload: "Editable")
+        let locked = Shard(id: "locked-shard", tagIds: [lockedTag.id], payload: "Locked")
+        [tag, lockedTag].forEach(context.insert)
+        [editable, locked].forEach(context.insert)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatch(
+            .addTag(tag.id),
+            to: [editable.id, locked.id, editable.id],
+            lockedTagID: lockedTag.id
+        )
+
+        XCTAssertEqual(receipt.changedIDs, [editable.id])
+        XCTAssertEqual(receipt.skippedLockedIDs, [locked.id])
+        XCTAssertTrue(editable.tagIds.contains(tag.id))
+        XCTAssertFalse(locked.tagIds.contains(tag.id))
+
+        let undoManager = UndoManager()
+        let undoController = VaultBatchUndoController()
+        undoController.register(receipt, with: undoManager, repository: repository)
+
+        undoManager.undo()
+        XCTAssertFalse(editable.tagIds.contains(tag.id))
+
+        undoManager.redo()
+        XCTAssertTrue(editable.tagIds.contains(tag.id))
+    }
+
+    @MainActor
+    func testBatchRestoreAllowsLockedTrashItems() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let lockedTag = Tag(id: "locked", name: "Locked", colorHex: "#666666", symbol: "lock.fill")
+        let deletedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let shard = Shard(
+            id: "locked-trash",
+            tagIds: [lockedTag.id],
+            deletedAt: deletedAt,
+            payload: "Recover me"
+        )
+        context.insert(lockedTag)
+        context.insert(shard)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatch(
+            .restore,
+            to: [shard.id],
+            lockedTagID: lockedTag.id
+        )
+
+        XCTAssertEqual(receipt.changedCount, 1)
+        XCTAssertTrue(receipt.skippedLockedIDs.isEmpty)
+        XCTAssertNil(shard.deletedAt)
+
+        try repository.replayBatch(receipt, direction: .undo)
+        XCTAssertEqual(shard.deletedAt, deletedAt)
+    }
+
+    @MainActor
+    func testBatchUndoRefusesToOverwriteNewerMetadata() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let shard = Shard(id: "conflict", payload: "Conflict")
+        context.insert(shard)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatch(.setPinned(true), to: [shard.id], lockedTagID: nil)
+        shard.updatedAt = shard.updatedAt.addingTimeInterval(10)
+        try context.save()
+
+        XCTAssertThrowsError(try repository.replayBatch(receipt, direction: .undo)) { error in
+            XCTAssertEqual(error as? ShardBatchError, .stateConflict)
+        }
+        XCTAssertTrue(shard.isPinned)
+    }
+
+    @MainActor
+    func testBatchUndoValidatesEveryShardBeforeRestoringAny() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let first = Shard(id: "first-conflict", payload: "First")
+        let second = Shard(id: "second-conflict", payload: "Second")
+        context.insert(first)
+        context.insert(second)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatch(
+            .setPinned(true),
+            to: [first.id, second.id],
+            lockedTagID: nil
+        )
+        second.updatedAt = second.updatedAt.addingTimeInterval(10)
+        try context.save()
+
+        XCTAssertThrowsError(try repository.replayBatch(receipt, direction: .undo)) { error in
+            XCTAssertEqual(error as? ShardBatchError, .stateConflict)
+        }
+        XCTAssertTrue(first.isPinned)
+        XCTAssertTrue(second.isPinned)
+    }
+
+    @MainActor
+    func testBatchMissingTagDoesNotMutateShard() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let shard = Shard(id: "missing-tag", payload: "Untouched")
+        context.insert(shard)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        XCTAssertThrowsError(
+            try repository.applyBatch(.addTag("not-found"), to: [shard.id], lockedTagID: nil)
+        ) { error in
+            XCTAssertEqual(error as? ShardBatchError, .missingTag)
+        }
+        XCTAssertTrue(shard.tagIds.isEmpty)
+    }
+
+    @MainActor
+    func testPermanentDeleteOnlyRemovesEligibleTrashAndAttachments() throws {
+        let container = try makeInMemoryVault()
+        let context = container.mainContext
+        let lockedTag = Tag(id: "locked-delete", name: "Locked", colorHex: "#666666", symbol: "lock.fill")
+        let live = Shard(id: "live", payload: "Live")
+        let trash = Shard(id: "trash", deletedAt: Date(), payload: "Trash")
+        let lockedTrash = Shard(id: "locked-trash-delete", tagIds: [lockedTag.id], deletedAt: Date(), payload: "Locked")
+        let trashAttachment = ShardAttachment(id: "trash-attachment", shardId: trash.id, originalName: "trash.txt", storedFileName: "trash.txt")
+        let lockedAttachment = ShardAttachment(id: "locked-attachment", shardId: lockedTrash.id, originalName: "locked.txt", storedFileName: "locked.txt")
+        context.insert(lockedTag)
+        [live, trash, lockedTrash].forEach(context.insert)
+        [trashAttachment, lockedAttachment].forEach(context.insert)
+        try context.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.permanentlyDelete(
+            shardIDs: [live.id, trash.id, lockedTrash.id, "missing"],
+            lockedTagID: lockedTag.id
+        )
+
+        XCTAssertEqual(receipt.deletedIDs, [trash.id])
+        XCTAssertEqual(receipt.skippedLiveIDs, [live.id])
+        XCTAssertEqual(receipt.skippedLockedIDs, [lockedTrash.id])
+        XCTAssertEqual(receipt.missingIDs, ["missing"])
+        XCTAssertEqual(Set(try context.fetch(FetchDescriptor<Shard>()).map(\.id)), [live.id, lockedTrash.id])
+        XCTAssertEqual(try context.fetch(FetchDescriptor<ShardAttachment>()).map(\.id), [lockedAttachment.id])
+    }
+
+    @MainActor
+    func testIsolatedBatchDoesNotCommitUnrelatedMainContextDraft() throws {
+        let container = try makeInMemoryVault()
+        let mainContext = container.mainContext
+        let shard = Shard(id: "isolated", payload: "Persisted")
+        mainContext.insert(shard)
+        try mainContext.save()
+
+        shard.payload = "Unsaved draft"
+        XCTAssertTrue(mainContext.hasChanges)
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatchInIsolatedContext(
+            .setPinned(true),
+            to: [shard.id],
+            lockedTagID: nil
+        )
+
+        XCTAssertEqual(receipt.changedCount, 1)
+        XCTAssertTrue(mainContext.hasChanges)
+        XCTAssertEqual(shard.payload, "Unsaved draft")
+
+        let verificationContext = ModelContext(container)
+        let persisted = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Shard>()).first(where: { $0.id == shard.id })
+        )
+        XCTAssertEqual(persisted.payload, "Persisted")
+        XCTAssertTrue(persisted.isPinned)
+    }
+
+    @MainActor
+    func testIsolatedBatchReplayDoesNotCommitUnrelatedMainContextDraft() throws {
+        let container = try makeInMemoryVault()
+        let mainContext = container.mainContext
+        let shard = Shard(id: "isolated-undo", payload: "Persisted")
+        mainContext.insert(shard)
+        try mainContext.save()
+
+        let repository = VaultRepository(container: container)
+        let receipt = try repository.applyBatch(.setPinned(true), to: [shard.id], lockedTagID: nil)
+        shard.payload = "Unsaved draft"
+
+        XCTAssertThrowsError(try repository.replayBatch(receipt, direction: .undo)) { error in
+            XCTAssertEqual(error as? ShardBatchError, .pendingChanges)
+        }
+
+        try repository.replayBatchInIsolatedContext(receipt, direction: .undo)
+
+        XCTAssertTrue(mainContext.hasChanges)
+        XCTAssertEqual(shard.payload, "Unsaved draft")
+        let verificationContext = ModelContext(container)
+        let persisted = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Shard>()).first(where: { $0.id == shard.id })
+        )
+        XCTAssertEqual(persisted.payload, "Persisted")
+        XCTAssertFalse(persisted.isPinned)
+    }
+
+    func testShardDragPayloadRoundTripsStableIDs() throws {
+        let payload = ShardDragPayload(shardIDs: ["first", "second"])
+        let data = try JSONEncoder().encode(payload)
+
+        XCTAssertEqual(try JSONDecoder().decode(ShardDragPayload.self, from: data), payload)
+        XCTAssertEqual(
+            ShardDragPayload.normalizedIDs(from: [
+                .init(shardIDs: ["second", "third"]),
+                .init(shardIDs: ["first", "second"])
+            ]),
+            ["second", "third", "first"]
+        )
+    }
+
+    func testShardSelectionPolicyRetainsVisibleMultiSelectionAndFallsBackToFirst() {
+        XCTAssertEqual(
+            ShardSelectionPolicy.reconciled(
+                current: ["first", "hidden", "third"],
+                visibleIDs: ["first", "second", "third"],
+                preserveHiddenSingleSelection: false
+            ),
+            ["first", "third"]
+        )
+        XCTAssertEqual(
+            ShardSelectionPolicy.reconciled(
+                current: ["missing"],
+                visibleIDs: ["first", "second"],
+                preserveHiddenSingleSelection: false
+            ),
+            ["first"]
+        )
+        XCTAssertEqual(
+            ShardSelectionPolicy.reconciled(
+                current: ["hidden"],
+                visibleIDs: [],
+                preserveHiddenSingleSelection: true
+            ),
+            ["hidden"]
+        )
+        XCTAssertTrue(
+            ShardSelectionPolicy.reconciled(
+                current: ["missing"],
+                visibleIDs: [],
+                preserveHiddenSingleSelection: false
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testRecentCaptureStorePersistsAndClearsOnlyMatchingID() throws {
+        let suiteName = "ShardsCoreTests.RecentCapture.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = RecentCaptureStore(defaults: defaults, notificationCenter: NotificationCenter())
+
+        store.record(shardID: "latest")
+        XCTAssertEqual(store.shardID, "latest")
+
+        store.clear(ifMatching: "older")
+        XCTAssertEqual(store.shardID, "latest")
+
+        store.clear(ifMatching: "latest")
+        XCTAssertNil(store.shardID)
+    }
+
+    @MainActor
     func testDefaultWelcomeShardsSeedHiddenGuideAsThirdShard() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let shards = VaultContainer.makeDefaultWelcomeShards(
@@ -562,5 +842,18 @@ final class ShardsCoreTests: XCTestCase {
 
         let content = try String(contentsOf: destinationURL, encoding: .utf8)
         XCTAssertEqual(content, "hello")
+    }
+
+    @MainActor
+    private func makeInMemoryVault() throws -> ModelContainer {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        return try ModelContainer(
+            for: Shard.self,
+            Tag.self,
+            PresetTemplate.self,
+            ShardCollection.self,
+            ShardAttachment.self,
+            configurations: configuration
+        )
     }
 }

@@ -394,6 +394,35 @@ protocol VaultRepositoryProtocol {
         tagIds: [String],
         encryptionMode: EncryptionMode
     ) throws -> Shard
+
+    func applyBatch(
+        _ operation: ShardBatchOperation,
+        to shardIDs: [String],
+        lockedTagID: String?
+    ) throws -> ShardBatchReceipt
+
+    func replayBatch(
+        _ receipt: ShardBatchReceipt,
+        direction: ShardBatchReplayDirection
+    ) throws
+
+    func applyBatchInIsolatedContext(
+        _ operation: ShardBatchOperation,
+        to shardIDs: [String],
+        lockedTagID: String?
+    ) throws -> ShardBatchReceipt
+
+    func replayBatchInIsolatedContext(
+        _ receipt: ShardBatchReceipt,
+        direction: ShardBatchReplayDirection
+    ) throws
+
+    func shard(withID id: String) throws -> Shard?
+
+    func permanentlyDelete(
+        shardIDs: [String],
+        lockedTagID: String?
+    ) throws -> ShardPermanentDeleteReceipt
 }
 
 @MainActor
@@ -466,6 +495,63 @@ final class VaultRepository: VaultRepositoryProtocol {
         encryptionMode: EncryptionMode = .none
     ) throws -> Shard {
         try save(payload: .raw(text), collectionId: collectionId, tagIds: tagIds, encryptionMode: encryptionMode)
+    }
+
+    func applyBatch(
+        _ operation: ShardBatchOperation,
+        to shardIDs: [String],
+        lockedTagID: String? = nil
+    ) throws -> ShardBatchReceipt {
+        try ShardBatchService(context: container.mainContext).apply(
+            operation,
+            to: shardIDs,
+            lockedTagID: lockedTagID
+        )
+    }
+
+    func replayBatch(
+        _ receipt: ShardBatchReceipt,
+        direction: ShardBatchReplayDirection
+    ) throws {
+        guard !container.mainContext.hasChanges else {
+            throw ShardBatchError.pendingChanges
+        }
+        try ShardBatchService(context: container.mainContext).replay(receipt, direction: direction)
+    }
+
+    func applyBatchInIsolatedContext(
+        _ operation: ShardBatchOperation,
+        to shardIDs: [String],
+        lockedTagID: String? = nil
+    ) throws -> ShardBatchReceipt {
+        let isolatedContext = ModelContext(container)
+        return try ShardBatchService(context: isolatedContext).apply(
+            operation,
+            to: shardIDs,
+            lockedTagID: lockedTagID
+        )
+    }
+
+    func replayBatchInIsolatedContext(
+        _ receipt: ShardBatchReceipt,
+        direction: ShardBatchReplayDirection
+    ) throws {
+        let isolatedContext = ModelContext(container)
+        try ShardBatchService(context: isolatedContext).replay(receipt, direction: direction)
+    }
+
+    func shard(withID id: String) throws -> Shard? {
+        try container.mainContext.fetch(FetchDescriptor<Shard>()).first(where: { $0.id == id })
+    }
+
+    func permanentlyDelete(
+        shardIDs: [String],
+        lockedTagID: String? = nil
+    ) throws -> ShardPermanentDeleteReceipt {
+        try ShardBatchService(context: container.mainContext).permanentlyDelete(
+            shardIDs: shardIDs,
+            lockedTagID: lockedTagID
+        )
     }
 }
 
