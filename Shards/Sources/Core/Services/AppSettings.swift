@@ -14,6 +14,7 @@ enum AppSettingKeys {
     static let editorFontSize = "editor_font_size"
     static let appearance = "app_appearance"
     static let lastUpdateCheckDate = "last_update_check_date"
+    static let spotlightIndexingEnabled = "spotlight_indexing_enabled"
 
     static let llmEndpointURL = "llm_endpoint_url"
     static let llmAPIToken = "llm_api_token"
@@ -23,6 +24,7 @@ enum AppSettingKeys {
     static let globalProtectionEnabled = "global_protection_enabled"
     static let globalProtectionSalt = "global_protection_salt"
     static let globalProtectionVerifier = "global_protection_verifier"
+    static let globalProtectionConfiguration = "global_protection_configuration_v2"
 
     static let legacyEditorBackgroundStyle = "editor_background_style"
     static let legacyEditorBackgroundColorHex = "editor_bg_color_hex"

@@ -49,10 +49,32 @@ private struct VaultOperationAlert: Identifiable {
     let message: String
 }
 
+private struct ShardRowSnapshot {
+    let title: String
+    let modeName: String
+    let iconName: String
+    let contentPreview: String
+}
+
 // MARK: - Main Window
 
 struct MainWindow: View {
     private static let untitledDisplayName = "untitled"
+    private static let listSameYearFormat = Date.FormatStyle()
+        .day()
+        .month(.abbreviated)
+        .hour()
+        .minute()
+    private static let listOtherYearFormat = Date.FormatStyle()
+        .day(.twoDigits)
+        .month(.twoDigits)
+        .year(.twoDigits)
+    private static let detailDateFormat = Date.FormatStyle()
+        .day()
+        .month(.abbreviated)
+        .year()
+        .hour()
+        .minute()
 
     @Environment(\.modelContext) private var context
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -63,14 +85,17 @@ struct MainWindow: View {
     @Query(sort: \PresetTemplate.orderIndex, order: .forward) private var templates: [PresetTemplate]
 
     @State private var keyboardMonitor = ModifierKeyMonitor()
+    @State private var commandDispatcher = VaultCommandDispatcher()
     @StateObject private var protection = ProtectionService.shared
 
     @State private var searchText = ""
     @State private var activeFilter: VaultFilter = .shards
     @State private var selectedShardIDs: Set<String> = []
     @State private var isHeaderCollapsed = false
-    @State private var isTagPopoverPresented = false
     @State private var isEditorFocused = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var previousColumnVisibility: NavigationSplitViewVisibility = .all
+    @FocusState private var isSearchFocused: Bool
 
     // Sidebar collapse state
     @State private var isPinnedExpanded = true
@@ -80,7 +105,7 @@ struct MainWindow: View {
     // Save state
     @State private var isDirty = false
     @State private var dirtyShardID: String?
-    @State private var saveDebounceTask: Task<Void, Never>?
+    @State private var saveScheduler = DebouncedSaveScheduler()
     @State private var batchUndoController = VaultBatchUndoController()
     @State private var operationAlert: VaultOperationAlert?
     @State private var operationNotice: String?
@@ -106,13 +131,12 @@ struct MainWindow: View {
     private let lockedTagName = "Locked"
 
     private var selectedShards: [Shard] {
-        filteredShards.filter { selectedShardIDs.contains($0.id) }
+        shards.filter { selectedShardIDs.contains($0.id) }
     }
 
     private var selectedShard: Shard? {
         guard selectedShardIDs.count == 1, let selectedShardID = selectedShardIDs.first else { return nil }
-        return filteredShards.first(where: { $0.id == selectedShardID })
-            ?? shards.first(where: { $0.id == selectedShardID })
+        return shards.first(where: { $0.id == selectedShardID })
     }
 
     private var recentCaptureShard: Shard? {
@@ -124,16 +148,6 @@ struct MainWindow: View {
         guard let shard = selectedShard else { return false }
         guard let lockedTagId = tags.first(where: { $0.name == lockedTagName })?.id else { return false }
         return shard.tagIds.contains(lockedTagId)
-    }
-
-    private var isSelectedShardProtected: Bool {
-        guard let shard = selectedShard else { return false }
-        return shard.encryptionMode == .perShard
-    }
-
-    private var isSelectedShardProtectionLocked: Bool {
-        guard let shard = selectedShard else { return false }
-        return shard.encryptionMode == .perShard && !protection.canAccess(shard)
     }
 
     private var canEditSelectedShard: Bool {
@@ -168,18 +182,26 @@ struct MainWindow: View {
     }
 
     private var sidebarCategories: [ShardCollection] {
-        var seenNames = Set<String>()
-        let categoryNames = templates
-            .filter { !$0.targetCollectionName.isEmpty }
-            .filter { seenNames.insert($0.targetCollectionName).inserted }
-            .map(\.targetCollectionName)
+        collections.filter { $0.id != VaultContainer.Defaults.allCollectionID }
+    }
 
-        return categoryNames.compactMap { categoryName in
-            collections.first(where: {
-                $0.name == categoryName &&
-                $0.id != VaultContainer.Defaults.allCollectionID &&
-                $0.name != VaultContainer.Defaults.shardsCollectionName
-            })
+    private var sidebarCategoryCounts: [String: Int] {
+        let validIDs = Set(sidebarCategories.map(\.id))
+        let fallbackID = sidebarCategories.first(where: {
+            $0.name.caseInsensitiveCompare(VaultContainer.Defaults.shardsCollectionName) == .orderedSame
+        })?.id
+        return shards.lazy.filter { $0.deletedAt == nil }.reduce(into: [:]) { counts, shard in
+            let categoryID = shard.collectionId.flatMap { validIDs.contains($0) ? $0 : nil }
+                ?? fallbackID
+            if let categoryID { counts[categoryID, default: 0] += 1 }
+        }
+    }
+
+    private var sidebarTagCounts: [String: Int] {
+        shards.lazy.filter { $0.deletedAt == nil }.reduce(into: [:]) { counts, shard in
+            for tagID in Set(shard.tagIds) {
+                counts[tagID, default: 0] += 1
+            }
         }
     }
 
@@ -207,26 +229,57 @@ struct MainWindow: View {
     // MARK: - Body
 
     var body: some View {
+        eventHandlingContent
+            .sheet(item: $protectionPrompt) { prompt in
+                ProtectionPasswordSheet(
+                    prompt: prompt,
+                    password: $protectionPassword,
+                    confirmation: $protectionPasswordConfirmation,
+                    errorMessage: protectionPromptMessage,
+                    onCancel: resetProtectionPrompt,
+                    onSubmit: { handleProtectionPrompt(prompt) }
+                )
+            }
+            .alert(item: $operationAlert) { alert in
+                Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    dismissButton: .default(Text("OK"))
+                )
+            }
+            .confirmationDialog(
+                permanentDeleteConfirmationTitle,
+                isPresented: permanentDeleteConfirmationBinding
+            ) {
+                Button("Delete Permanently", role: .destructive) {
+                    confirmPermanentDelete()
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingPermanentDeleteIDs = []
+                }
+            } message: {
+                Text("This cannot be undone.")
+            }
+    }
+
+    private var baseWindowContent: some View {
         ZStack {
             AppBackgroundView()
                 .ignoresSafeArea()
 
             splitView
-                .opacity(isEditorFocused ? 0 : 1)
-                .allowsHitTesting(!isEditorFocused)
-
-            if isEditorFocused {
-                detailContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .transition(.opacity)
-            }
 
             if protection.requiresGlobalUnlock {
                 globalProtectionOverlay
             }
+
+            if !VaultContainer.shared.isPersistentStoreAvailable {
+                VaultUnavailableOverlay(
+                    detail: VaultContainer.shared.startupIssue
+                        ?? "Shards could not open its persistent store. Editing is disabled to protect your data."
+                )
+            }
         }
-        .animation(.smooth(duration: 0.3), value: isEditorFocused)
-        .toolbar(removing: .sidebarToggle)
         .toolbar {
             if isEditorFocused, selectedShard != nil {
                 ToolbarItem(placement: .primaryAction) {
@@ -241,18 +294,7 @@ struct MainWindow: View {
                 }
             }
         }
-        .overlay {
-            VStack {
-                Button("Save") { saveCurrentShard() }
-                    .keyboardShortcut("s", modifiers: .command)
-                Button("Pin") { if let shard = selectedShard { togglePin(shard) } }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
-            }
-            .frame(width: 0, height: 0)
-            .opacity(0)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-        }
+        .focusedSceneValue(\.vaultCommandDispatcher, commandDispatcher)
         .overlay(alignment: .top) {
             if let message = operationNotice ?? VaultContainer.shared.startupIssue {
                 Text(message)
@@ -264,6 +306,10 @@ struct MainWindow: View {
                     .padding(.top, 12)
             }
         }
+    }
+
+    private var stateReconciliationContent: some View {
+        baseWindowContent
         .onChange(of: filteredShards.map(\.id)) { _, ids in
             let reconciled = ShardSelectionPolicy.reconciled(
                 current: selectedShardIDs,
@@ -274,13 +320,23 @@ struct MainWindow: View {
                 selectedShardIDs = reconciled
             }
         }
+        .onChange(of: shards.map(\.id)) { _, _ in
+            // A Spotlight activity can arrive before SwiftData has populated
+            // the first query during a cold launch. Keep the pending request
+            // until the matching model becomes available.
+            openPendingSpotlightShardIfNeeded()
+        }
         .onChange(of: selectedShardIDs) { _, selection in
             if selection.count != 1, isEditorFocused {
-                isEditorFocused = false
+                exitEditorFocus()
             }
+        }
+        .onChange(of: vaultCommandState, initial: true) { _, state in
+            commandDispatcher.update(state)
         }
         .onAppear {
             recentCaptureID = RecentCaptureStore.shared.shardID
+            openPendingSpotlightShardIfNeeded()
             batchUndoController.onError = { message in
                 operationAlert = VaultOperationAlert(title: "Unable to Undo", message: message)
             }
@@ -288,16 +344,32 @@ struct MainWindow: View {
                 persistPendingEdits()
             }
         }
+    }
+
+    private var eventHandlingContent: some View {
+        stateReconciliationContent
         .onReceive(NotificationCenter.default.publisher(for: .recentCaptureDidChange)) { _ in
             recentCaptureID = RecentCaptureStore.shared.shardID
         }
+        .onReceive(NotificationCenter.default.publisher(for: .vaultFlushRequested)) { notification in
+            guard let request = notification.object as? VaultFlushRequest else { return }
+            if !persistPendingEdits() {
+                request.recordFailure("The open shard still has unsaved changes.")
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .shardsWerePermanentlyDeleted)) { notification in
+            guard let shardIDs = notification.object as? [String] else { return }
+            prepareForPermanentDeletion(shardIDs)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openShardRequested)) { notification in
-            guard let shardID = notification.object as? String,
-                  let shard = shards.first(where: { $0.id == shardID })
+            guard let shardID = notification.object as? String else { return }
+            openShard(withID: shardID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .vaultCommandRequested)) { notification in
+            guard let request = notification.object as? VaultCommandRequest,
+                  request.targetID == commandDispatcher.targetID
             else { return }
-            searchText = ""
-            activeFilter = shard.deletedAt == nil ? .shards : .trash
-            selectedShardIDs = [shardID]
+            performVaultCommand(request.command)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             withAnimation(.easeInOut(duration: 0.25)) { isWindowActive = false }
@@ -306,49 +378,35 @@ struct MainWindow: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             withAnimation(.easeInOut(duration: 0.25)) { isWindowActive = true }
         }
-        .sheet(item: $protectionPrompt) { prompt in
-            ProtectionPasswordSheet(
-                prompt: prompt,
-                password: $protectionPassword,
-                confirmation: $protectionPasswordConfirmation,
-                errorMessage: protectionPromptMessage,
-                onCancel: resetProtectionPrompt,
-                onSubmit: { handleProtectionPrompt(prompt) }
-            )
-        }
-        .alert(item: $operationAlert) { alert in
-            Alert(
-                title: Text(alert.title),
-                message: Text(alert.message),
-                dismissButton: .default(Text("OK"))
-            )
-        }
-        .confirmationDialog(
-            pendingPermanentDeleteIDs.count == 1 ? "Delete Shard Permanently?" : "Delete \(pendingPermanentDeleteIDs.count) Shards Permanently?",
-            isPresented: Binding(
-                get: { !pendingPermanentDeleteIDs.isEmpty },
-                set: { if !$0 { pendingPermanentDeleteIDs = [] } }
-            )
-        ) {
-            Button("Delete Permanently", role: .destructive) {
-                permanentlyDelete(Array(pendingPermanentDeleteIDs))
-                pendingPermanentDeleteIDs = []
+    }
+
+    private var permanentDeleteConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { !pendingPermanentDeleteIDs.isEmpty },
+            set: { isPresented in
+                if !isPresented {
+                    pendingPermanentDeleteIDs = []
+                }
             }
-            Button("Cancel", role: .cancel) {
-                pendingPermanentDeleteIDs = []
-            }
-        } message: {
-            Text("This cannot be undone.")
+        )
+    }
+
+    private var permanentDeleteConfirmationTitle: String {
+        if pendingPermanentDeleteIDs.count == 1 {
+            return "Delete Shard Permanently?"
         }
+        return "Delete \(pendingPermanentDeleteIDs.count) Shards Permanently?"
     }
 
     private var splitView: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebarContent
                 .navigationTitle("Shards")
+                .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 280)
         } content: {
             shardListContent
                 .navigationTitle(filterTitle)
+                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 400)
                 .toolbar {
                     if !isEditorFocused {
                         if recentCaptureShard != nil {
@@ -399,8 +457,52 @@ struct MainWindow: View {
         }
         .navigationSplitViewStyle(.balanced)
         .background(.clear)
-        .toolbar(removing: .sidebarToggle)
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search shards…")
+        .searchFocused($isSearchFocused)
+    }
+}
+
+private extension MainWindow {
+    var vaultCommandState: VaultCommandState {
+        VaultCommandState(
+            canSave: selectedShard != nil,
+            canTogglePin: selectedShard.map { !shardIsLocked($0) && $0.deletedAt == nil } ?? false,
+            canMoveToTrash: selectedShards.contains { !shardIsLocked($0) && $0.deletedAt == nil },
+            isEditorFocused: isEditorFocused
+        )
+    }
+
+    func performVaultCommand(_ command: VaultCommand) {
+        switch command {
+        case .createShard:
+            createNewShard()
+        case .save:
+            saveCurrentShard()
+        case .togglePin:
+            if let shard = selectedShard {
+                togglePin(shard)
+            }
+        case .moveToTrash:
+            moveSelectionToTrash()
+        case .focusSearch:
+            focusVaultSearch()
+        case .toggleEditorFocus:
+            toggleEditorFocus()
+        }
+    }
+
+    func focusVaultSearch() {
+        if isEditorFocused {
+            exitEditorFocus()
+        } else if columnVisibility == .detailOnly {
+            withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) {
+                columnVisibility = .all
+            }
+        }
+        Task { @MainActor in
+            await Task.yield()
+            isSearchFocused = true
+        }
     }
 }
 
@@ -408,7 +510,10 @@ struct MainWindow: View {
 
 private extension MainWindow {
     var sidebarContent: some View {
-        List(selection: $activeFilter) {
+        let categoryCounts = sidebarCategoryCounts
+        let tagCounts = sidebarTagCounts
+
+        return List(selection: $activeFilter) {
             Section("Locations") {
                 sidebarRow(
                     label: "All Shards",
@@ -445,12 +550,11 @@ private extension MainWindow {
             if !sidebarCategories.isEmpty {
                 Section(isExpanded: $isCategoriesExpanded) {
                     ForEach(sidebarCategories) { collection in
-                        let count = shards.filter { $0.collectionId == collection.id && $0.deletedAt == nil }.count
                         sidebarRow(
                             label: collection.name,
                             icon: collection.icon,
                             filter: .category(collection.id),
-                            count: count
+                            count: categoryCounts[collection.id, default: 0]
                         )
                     }
                 } header: {
@@ -461,12 +565,11 @@ private extension MainWindow {
             if !sidebarTags.isEmpty {
                 Section(isExpanded: $isTagsExpanded) {
                     ForEach(sidebarTags) { tag in
-                        let count = shards.filter { $0.tagIds.contains(tag.id) && $0.deletedAt == nil }.count
                         sidebarRow(
                             label: tag.name,
                             icon: tag.symbol,
                             filter: .tag(tag.id),
-                            count: count,
+                            count: tagCounts[tag.id, default: 0],
                             tintColor: Color(hex: tag.colorHex)
                         )
                         .shardDropTarget(accentColor: Color(hex: tag.colorHex) ?? appAccentColor) { payloads in
@@ -481,7 +584,6 @@ private extension MainWindow {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .background(.clear)
-        .onDeleteCommand(perform: moveSelectionToTrash)
         .tint(appAccentColor)
     }
 
@@ -503,45 +605,101 @@ private extension MainWindow {
 // MARK: - Shard List
 
 private extension MainWindow {
+    @ViewBuilder
     var shardListContent: some View {
-        List(selection: $selectedShardIDs) {
-            ForEach(filteredShards) { shard in
-                ShardListRow(
-                    title: title(for: shard),
-                    modeName: modeName(for: shard),
-                    iconName: iconName(for: shard),
-                    isPinned: shard.isPinned,
-                    isDeleted: shard.deletedAt != nil,
-                    isLocked: shardIsLocked(shard),
-                    isProtected: shard.encryptionMode != .none,
-                    tags: resolvedTags(for: shard),
-                    dateString: listDateString(for: shard.updatedAt),
-                    isCompact: sidebarCompact,
-                    accentColor: appAccentColor,
-                    contentPreview: contentPreview(for: shard)
-                )
-                .tag(shard.id)
-                .draggable(dragPayload(for: shard)) {
-                    dragPreview(for: shard)
-                }
-                .contextMenu {
-                    if selectedShardIDs.count > 1, selectedShardIDs.contains(shard.id) {
-                        batchContextMenu
-                    } else {
-                        shardContextMenu(for: shard)
+        if filteredShards.isEmpty {
+            shardListEmptyState
+        } else {
+            List(selection: $selectedShardIDs) {
+                ForEach(filteredShards) { shard in
+                    let snapshot = rowSnapshot(for: shard)
+                    ShardListRow(
+                        title: snapshot.title,
+                        modeName: snapshot.modeName,
+                        iconName: snapshot.iconName,
+                        isPinned: shard.isPinned,
+                        isDeleted: shard.deletedAt != nil,
+                        isLocked: shardIsLocked(shard),
+                        isProtected: shard.encryptionMode != .none,
+                        tags: resolvedTags(for: shard),
+                        dateString: listDateString(for: shard.updatedAt),
+                        isCompact: sidebarCompact,
+                        accentColor: appAccentColor,
+                        contentPreview: snapshot.contentPreview
+                    )
+                    .tag(shard.id)
+                    .draggable(dragPayload(for: shard)) {
+                        dragPreview(for: shard)
+                    }
+                    .contextMenu {
+                        if selectedShardIDs.count > 1, selectedShardIDs.contains(shard.id) {
+                            batchContextMenu
+                        } else {
+                            shardContextMenu(for: shard)
+                        }
+                    }
+                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                        leadingSwipeActions(for: shard)
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        trailingSwipeActions(for: shard)
                     }
                 }
-                .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    leadingSwipeActions(for: shard)
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    trailingSwipeActions(for: shard)
+            }
+            .listStyle(.inset)
+            .scrollContentBackground(.hidden)
+            .background(.clear)
+            .onDeleteCommand(perform: moveSelectionToTrash)
+        }
+    }
+
+    @ViewBuilder
+    var shardListEmptyState: some View {
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ContentUnavailableView {
+                Label("No Results", systemImage: "magnifyingglass")
+            } description: {
+                Text("No shards match “\(searchText)”.")
+            } actions: {
+                Button("Clear Search") { searchText = "" }
+                    .buttonStyle(.bordered)
+            }
+        } else {
+            ContentUnavailableView {
+                Label(emptyListTitle, systemImage: emptyListSymbol)
+            } description: {
+                Text(emptyListDescription)
+            } actions: {
+                if activeFilter != .trash {
+                    Button("New Shard", action: createNewShard)
+                        .buttonStyle(.borderedProminent)
                 }
             }
         }
-        .listStyle(.inset)
-        .scrollContentBackground(.hidden)
-        .background(.clear)
+    }
+
+    var emptyListTitle: String {
+        switch activeFilter {
+        case .trash: "Trash Is Empty"
+        case .category: "No Shards in This Category"
+        case .tag: "No Shards with This Tag"
+        case .pinnedShard: "Pinned Shard Unavailable"
+        case .shards: "Your Vault Is Empty"
+        }
+    }
+
+    var emptyListSymbol: String {
+        activeFilter == .trash ? "trash" : "tray"
+    }
+
+    var emptyListDescription: String {
+        switch activeFilter {
+        case .trash: "Deleted shards stay here until you remove them permanently."
+        case .category: "Create a shard or choose another category."
+        case .tag: "Drag a shard onto this tag to add it here."
+        case .pinnedShard: "This pinned shard is hidden by the current filter."
+        case .shards: "Create a shard or use Quick Entry to capture your first thought."
+        }
     }
 
     func dragPayload(for shard: Shard) -> ShardDragPayload {
@@ -566,32 +724,84 @@ private extension MainWindow {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    func contentPreview(for shard: Shard) -> String {
-        guard let raw = accessiblePayloadText(for: shard) else {
-            return shard.encryptionMode == .global ? "Vault protected" : "Protected content"
-        }
-        if let data = raw.data(using: .utf8),
-           let preset = try? JSONDecoder().decode(PresetPayload.self, from: data) {
-            let contentField = preset.fields.first(where: {
-                let key = $0.name.lowercased()
-                return key.contains("content") || key.contains("note") || key.contains("body")
-            }) ?? preset.fields.first
-            let text = contentField?.value ?? ""
-            let clean = text
-                .replacingOccurrences(of: "#", with: "")
-                .replacingOccurrences(of: "**", with: "")
-                .replacingOccurrences(of: "*", with: "")
-                .replacingOccurrences(of: "~~", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let firstLine = clean.components(separatedBy: .newlines).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
-            return String(firstLine.prefix(80))
-        }
+    func plainPreview(from raw: String) -> String {
         let clean = raw
             .replacingOccurrences(of: "#", with: "")
             .replacingOccurrences(of: "**", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let firstLine = clean.components(separatedBy: .newlines).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
         return String(firstLine.prefix(80))
+    }
+
+    func rowSnapshot(for shard: Shard) -> ShardRowSnapshot {
+        let raw = accessiblePayloadText(for: shard)
+        let decodingResult = raw.map { payloadDecodingResult(from: $0) }
+        let payload: PresetPayload?
+        if case let .decoded(decoded)? = decodingResult {
+            payload = decoded
+        } else {
+            payload = nil
+        }
+        let isMalformedStructured: Bool
+        if case .malformedStructured? = decodingResult {
+            isMalformedStructured = true
+        } else {
+            isMalformedStructured = false
+        }
+
+        let rowTitle: String
+        if isExplicitUntitledTitle(shard) {
+            rowTitle = Self.untitledDisplayName
+        } else if raw == nil {
+            rowTitle = shard.encryptionMode == .perShard ? "Protected Shard" : "Vault Shard"
+        } else if isMalformedStructured {
+            rowTitle = "Structured Shard"
+        } else if let payload,
+                  let customName = safeStoredDisplayName(for: shard, payload: payload) {
+            rowTitle = customName
+        } else if let payload {
+            rowTitle = derivedTitle(from: payload)
+        } else if let customName = shard.displayName.flatMap({ $0.isEmpty ? nil : $0 }) {
+            rowTitle = customName
+        } else if let raw {
+            rowTitle = PresetPayload.raw(raw).displayTitle
+        } else {
+            rowTitle = shard.encryptionMode == .perShard ? "Protected Shard" : "Vault Shard"
+        }
+
+        let rowMode: String
+        if raw == nil {
+            rowMode = shard.encryptionMode == .perShard ? "Protected" : "Vault"
+        } else if isMalformedStructured {
+            rowMode = "Structured"
+        } else {
+            rowMode = payload?.normalizedPresetType ?? "Shard"
+        }
+
+        let rowIcon: String
+        if shard.encryptionMode != .none {
+            rowIcon = "shield.lefthalf.filled"
+        } else {
+            rowIcon = iconName(forMode: rowMode)
+        }
+
+        let preview: String
+        if let payload {
+            preview = payload.safePreviewText
+        } else if isMalformedStructured {
+            preview = "Structured content unavailable"
+        } else if let raw {
+            preview = plainPreview(from: raw)
+        } else {
+            preview = shard.encryptionMode == .global ? "Vault protected" : "Protected content"
+        }
+
+        return ShardRowSnapshot(
+            title: rowTitle,
+            modeName: rowMode,
+            iconName: rowIcon,
+            contentPreview: preview
+        )
     }
 }
 
@@ -604,28 +814,24 @@ private extension MainWindow {
             batchSelectionView
         } else if let shard = selectedShard {
             let isHidden = tags.first(where: { $0.name == systemHiddenTagName }).map { shard.tagIds.contains($0.id) } ?? false
-            ZStack(alignment: .bottom) {
+            ZStack {
                 VStack(spacing: 0) {
                     detailHeader(for: shard)
 
                     detailPayload(for: shard)
                         .padding(.horizontal, 18)
-                        .padding(.bottom, showStatusBar ? 54 : 18)
+                        .padding(.bottom, 10)
                         .blur(radius: isHidden && !isWindowActive ? 10 : 0)
                         .animation(.easeInOut(duration: reduceMotion ? 0 : 0.2), value: isWindowActive)
+
+                    if showStatusBar {
+                        editorStatusBar(for: shard)
+                            .transition(.opacity)
+                    }
                 }
 
                 if shard.encryptionMode == .perShard && !protection.canAccess(shard) {
                     protectedShardOverlay(for: shard)
-                }
-
-                // Floating status pill
-                if showStatusBar {
-                    editorStatusBar(for: shard)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.trailing, 20)
-                        .padding(.bottom, 14)
-                        .transition(.opacity)
                 }
             }
             .background(.clear)
@@ -692,26 +898,31 @@ private extension MainWindow {
     }
 
     func detailHeader(for shard: Shard) -> some View {
-        let titleBinding = Binding(
-            get: {
-                if isExplicitUntitledTitle(shard) {
+        let shardID = shard.id
+        let titleBinding = ShardDetailBindingAccess.binding(
+            shardID: shardID,
+            fallback: "",
+            isActive: { selectedShardIDs.contains(shardID) },
+            resolve: { id in shards.first(where: { $0.id == id }) },
+            read: { currentShard in
+                if isExplicitUntitledTitle(currentShard) {
                     return ""
                 }
-                return shard.displayName ?? derivedTitle(for: shard)
+                return title(for: currentShard)
             },
-            set: { newValue in
+            write: { currentShard, newValue in
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 let nextDisplayName: String?
                 if trimmed.isEmpty {
                     nextDisplayName = Self.untitledDisplayName
-                } else if trimmed == derivedTitle(for: shard) {
+                } else if trimmed == derivedTitle(for: currentShard) {
                     nextDisplayName = nil
                 } else {
                     nextDisplayName = trimmed
                 }
-                guard shard.displayName != nextDisplayName else { return }
-                shard.displayName = nextDisplayName
-                markDirty(for: shard)
+                guard currentShard.displayName != nextDisplayName else { return }
+                currentShard.displayName = nextDisplayName
+                markDirty(for: currentShard)
             }
         )
 
@@ -738,55 +949,45 @@ private extension MainWindow {
                 .frame(height: 52)
                 .transition(.opacity)
             } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    Label(categoryName(for: shard), systemImage: iconName(for: shard))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(appAccentColor)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(appAccentColor.opacity(0.11), in: Capsule())
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        Label(categoryName(for: shard), systemImage: iconName(for: shard))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(appAccentColor)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(appAccentColor.opacity(0.11), in: Capsule())
+
+                        Spacer(minLength: 12)
+
+                        Label(detailDateString(for: shard.createdAt), systemImage: "calendar")
+                            .help("Created")
+
+                        Label(detailDateString(for: shard.updatedAt), systemImage: "clock")
+                            .help("Last edited")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
 
                     TextField(Self.untitledDisplayName, text: titleBinding)
-                        .font(.largeTitle.weight(.semibold))
+                        .font(.title.weight(.semibold))
                         .textFieldStyle(.plain)
                         .lineLimit(1)
                         .disabled(!canEditSelectedShard)
 
-                    FlowLayout(spacing: 6) {
-                        Label("Created \(detailDateString(for: shard.createdAt))", systemImage: "calendar")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-
-                        Label("Edited \(detailDateString(for: shard.updatedAt))", systemImage: "clock")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-
-                        let attachedTags = tags.filter { shard.tagIds.contains($0.id) }
-                        ForEach(attachedTags) { tag in
-                            tagChip(tag, shard: shard)
-                        }
-
-                        if canEditSelectedShard {
-                            Button {
-                                isTagPopoverPresented = true
-                            } label: {
-                                Label("Add Tag", systemImage: "plus")
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 4)
-                                    .background(.quaternary.opacity(0.55), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .popover(isPresented: $isTagPopoverPresented, arrowEdge: .top) {
-                                tagPopover(for: shard)
-                            }
-                        }
+                    DetailTagSection(
+                        attachedTags: attachedTags(for: shard),
+                        canEdit: canEditSelectedShard,
+                        accentColor: appAccentColor,
+                        onSelect: { tag in navigateToTag(tag, selectedShard: shard) },
+                        onRemove: { tag in removeTag(tag, from: shard) }
+                    ) {
+                        tagPopover(for: shard)
                     }
                 }
-                .padding(.horizontal, 28)
-                .padding(.top, 18)
-                .padding(.bottom, 20)
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 16)
                 .transition(.opacity)
             }
         }
@@ -800,8 +1001,23 @@ private extension MainWindow {
     }
 
     func toggleEditorFocus() {
-        withAnimation(.easeInOut(duration: reduceMotion ? 0 : 0.2)) {
-            isEditorFocused.toggle()
+        if isEditorFocused {
+            exitEditorFocus()
+        } else {
+            previousColumnVisibility = columnVisibility
+            withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) {
+                isEditorFocused = true
+                columnVisibility = .detailOnly
+            }
+        }
+    }
+
+    func exitEditorFocus() {
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) {
+            isEditorFocused = false
+            columnVisibility = previousColumnVisibility == .detailOnly
+                ? .all
+                : previousColumnVisibility
         }
     }
 
@@ -812,25 +1028,34 @@ private extension MainWindow {
     }
 
     func detailPayload(for shard: Shard) -> some View {
-        PayloadRendererView(
-            payloadText: Binding(
-                get: {
-                    (try? protection.plaintext(for: shard)) ?? ""
+        let shardID = shard.id
+        return PayloadRendererView(
+            payloadText: ShardDetailBindingAccess.binding(
+                shardID: shardID,
+                fallback: "",
+                isActive: { selectedShardIDs.contains(shardID) },
+                resolve: { id in shards.first(where: { $0.id == id }) },
+                read: { currentShard in
+                    return (try? protection.plaintext(for: currentShard)) ?? ""
                 },
-                set: { newValue in
+                write: { currentShard, newValue in
                     do {
-                        shard.payload = try protection.encryptPayloadForPersistence(newValue, mode: shard.encryptionMode, shard: shard)
+                        currentShard.payload = try protection.encryptPayloadForPersistence(
+                            newValue,
+                            mode: currentShard.encryptionMode,
+                            shard: currentShard
+                        )
                     } catch {
                         protectionPromptMessage = error.localizedDescription
+                        return
                     }
-                    markDirty(for: shard)
+                    markDirty(for: currentShard)
                 }
             ),
-            shard: shard,
-            onEdited: {}
+            contentID: shardID,
+            isEditable: canEditSelectedShard
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .disabled(!canEditSelectedShard)
     }
 
     var globalProtectionOverlay: some View {
@@ -908,14 +1133,14 @@ private extension MainWindow {
     }
 }
 
-// MARK: - Editor Status Bar (Floating Pill)
+// MARK: - Editor Status Bar
 
 private extension MainWindow {
     func editorStatusBar(for shard: Shard) -> some View {
         let accessibleText = (try? protection.plaintext(for: shard)) ?? ""
         let plainText = extractPlainText(from: accessibleText)
-        let stats = computeStats(for: plainText)
         let items = editorStatsItems.split(separator: ",").map(String.init)
+        let stats = computeStats(for: plainText, requestedItems: Set(items))
 
         return HStack(spacing: 14) {
             HStack(spacing: 10) {
@@ -932,8 +1157,10 @@ private extension MainWindow {
                 }
             }
 
+            Spacer(minLength: 12)
+
             Divider()
-                .frame(height: 14)
+                .frame(height: 13)
 
             Group {
                 if shard.encryptionMode == .perShard && !protection.canAccess(shard) {
@@ -992,38 +1219,50 @@ private extension MainWindow {
             }
             .animation(.easeInOut(duration: reduceMotion ? 0 : 0.15), value: isDirty)
         }
-        .padding(.horizontal, 13)
-        .frame(height: 32)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(.separator.opacity(0.45), lineWidth: 0.5)
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.44))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(.separator.opacity(0.35))
+                .frame(height: 0.5)
         }
-        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 3)
-        .fixedSize()
     }
 
     func extractPlainText(from payload: String) -> String {
-        if let data = payload.data(using: .utf8),
-           let preset = try? JSONDecoder().decode(PresetPayload.self, from: data) {
+        if case let .decoded(preset) = PresetPayload.decoding(payload) {
             return preset.plainTextContent
         }
         return payload
     }
 
-    func computeStats(for text: String) -> [String: Int] {
+    func computeStats(for text: String, requestedItems: Set<String>) -> [String: Int] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let words = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
-        let characters = trimmed.count
-        let sentences = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: CharacterSet(charactersIn: ".!?")).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
-        let paragraphs = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
-
-        return [
-            "words": words,
-            "characters": characters,
-            "sentences": sentences,
-            "paragraphs": paragraphs
-        ]
+        var stats: [String: Int] = [:]
+        if requestedItems.contains("words") {
+            stats["words"] = trimmed.isEmpty
+                ? 0
+                : trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
+        }
+        if requestedItems.contains("characters") {
+            stats["characters"] = trimmed.count
+        }
+        if requestedItems.contains("sentences") {
+            stats["sentences"] = trimmed.isEmpty
+                ? 0
+                : trimmed.components(separatedBy: CharacterSet(charactersIn: ".!?")).filter {
+                    !$0.trimmingCharacters(in: .whitespaces).isEmpty
+                }.count
+        }
+        if requestedItems.contains("paragraphs") {
+            stats["paragraphs"] = trimmed.isEmpty
+                ? 0
+                : trimmed.components(separatedBy: "\n\n").filter {
+                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }.count
+        }
+        return stats
     }
 
     func statLabel(_ key: String) -> String {
@@ -1040,32 +1279,19 @@ private extension MainWindow {
 // MARK: - Tag UI
 
 private extension MainWindow {
-    func tagChip(_ tag: Tag, shard: Shard) -> some View {
-        let color = Color(hex: tag.colorHex) ?? .secondary
-        return Button { navigateToTag(tag, selectedShard: shard) } label: {
-            HStack(spacing: 4) {
-                Image(systemName: tag.symbol)
-                    .font(.caption2.weight(.semibold))
-                Text(tag.name)
-                    .font(.caption.weight(.medium))
-            }
-            .foregroundStyle(color)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.12), in: Capsule())
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button(role: .destructive) { removeTag(tag, from: shard) } label: {
-                Label("Remove Tag", systemImage: "tag.slash")
-            }
+    func attachedTags(for shard: Shard) -> [Tag] {
+        let tagsByID = Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0) })
+        var seen = Set<String>()
+        return shard.tagIds.compactMap { id in
+            guard seen.insert(id).inserted else { return nil }
+            return tagsByID[id]
         }
     }
 
     @ViewBuilder
     func tagPopover(for shard: Shard) -> some View {
         TagPopoverContent(
-            shard: shard,
+            attachedTagIDs: Set(shard.tagIds),
             availableTags: assignableTags(for: shard),
             accentColor: appAccentColor,
             onToggleTag: { tag in toggleTag(tag, on: shard) },
@@ -1263,9 +1489,11 @@ private extension MainWindow {
         }
     }
 
-    func resolvedTags(for shard: Shard) -> [(name: String, symbol: String, colorHex: String)] {
+    func resolvedTags(for shard: Shard) -> [ShardTagSummary] {
         sidebarTags.filter { shard.tagIds.contains($0.id) }
-            .map { (name: $0.name, symbol: $0.symbol, colorHex: $0.colorHex) }
+            .map {
+                ShardTagSummary(id: $0.id, name: $0.name, symbol: $0.symbol, colorHex: $0.colorHex)
+            }
     }
 
     func shardIsLocked(_ shard: Shard) -> Bool {
@@ -1294,7 +1522,7 @@ private extension MainWindow {
         case let .tag(id): return shard.tagIds.contains(id)
         case .shards: return true
         case let .pinnedShard(id): return shard.id == id
-        case let .category(id): return shard.collectionId == id
+        case let .category(id): return effectiveCollectionID(for: shard) == id
         case .trash: return true
         }
     }
@@ -1317,20 +1545,44 @@ private extension MainWindow {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return true }
         let shardTags = tags.filter { shard.tagIds.contains($0.id) }
-        let searchablePayload = plainTextDocument(for: shard)?
+        let raw = accessiblePayloadText(for: shard)
+        let searchablePayload = raw.map { raw -> String in
+            switch payloadDecodingResult(from: raw) {
+            case let .decoded(payload):
+                return payload.safeSearchableContent
+            case .plainText:
+                return raw
+            case .malformedStructured:
+                return ""
+            }
+        }
+        let payloadMatches = searchablePayload?
             .lowercased()
             .contains(query) ?? false
         return title(for: shard).lowercased().contains(query)
-            || searchablePayload
+            || payloadMatches
             || shardTags.contains(where: { $0.name.lowercased().contains(query) })
     }
 
     // MARK: Payload helpers
 
     func payload(for shard: Shard) -> PresetPayload? {
-        guard let raw = accessiblePayloadText(for: shard),
-              let data = raw.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(PresetPayload.self, from: data)
+        guard let raw = accessiblePayloadText(for: shard) else { return nil }
+        return resolvedPayload(from: raw)
+    }
+
+    func resolvedPayload(from raw: String) -> PresetPayload? {
+        guard case let .decoded(payload) = payloadDecodingResult(from: raw) else { return nil }
+        return payload
+    }
+
+    func payloadDecodingResult(from raw: String) -> PresetPayloadDecodingResult {
+        let result = PresetPayload.decoding(raw)
+        guard case let .decoded(decoded) = result else {
+            return result
+        }
+        let schema = templates.matchingTemplate(for: decoded)?.schema
+        return .decoded(decoded.resolvingMetadata(using: schema))
     }
 
     func accessiblePayloadText(for shard: Shard) -> String? {
@@ -1348,8 +1600,20 @@ private extension MainWindow {
         if isExplicitUntitledTitle(shard) {
             return Self.untitledDisplayName
         }
-        if let customName = shard.displayName, !customName.isEmpty { return customName }
-        return derivedTitle(for: shard)
+        guard let raw = accessiblePayloadText(for: shard) else {
+            return shard.encryptionMode == .perShard ? "Protected Shard" : "Vault Shard"
+        }
+
+        switch payloadDecodingResult(from: raw) {
+        case let .decoded(payload):
+            return safeStoredDisplayName(for: shard, payload: payload)
+                ?? derivedTitle(from: payload)
+        case .plainText:
+            return shard.displayName.flatMap { $0.isEmpty ? nil : $0 }
+                ?? PresetPayload.raw(raw).displayTitle
+        case .malformedStructured:
+            return "Structured Shard"
+        }
     }
 
     func isExplicitUntitledTitle(_ shard: Shard) -> Bool {
@@ -1362,16 +1626,41 @@ private extension MainWindow {
         guard let raw = accessiblePayloadText(for: shard) else {
             return shard.encryptionMode == .perShard ? "Protected Shard" : "Vault Shard"
         }
-        guard let payload = payload(for: shard) else {
+        switch payloadDecodingResult(from: raw) {
+        case let .decoded(payload):
+            return derivedTitle(from: payload)
+        case .plainText:
             return PresetPayload.raw(raw).displayTitle
+        case .malformedStructured:
+            return "Structured Shard"
         }
-        guard let template = templates.first(where: { $0.name.caseInsensitiveCompare(payload.presetType) == .orderedSame }),
+    }
+
+    func safeStoredDisplayName(for shard: Shard, payload: PresetPayload) -> String? {
+        guard let displayName = shard.displayName, !displayName.isEmpty else { return nil }
+        if payload.displayNameExposesSensitiveValue(displayName) {
+            return nil
+        }
+        guard let schema = templates.matchingTemplate(for: payload)?.schema,
+              let evaluation = schema.displayNameEvaluation(for: payload),
+              evaluation.includesSensitiveField,
+              evaluation.value == displayName else {
+            return displayName
+        }
+        return nil
+    }
+
+    func derivedTitle(from payload: PresetPayload) -> String {
+        guard let template = templates.matchingTemplate(for: payload),
               let titleFieldKey = template.schema.titleFieldKey,
-              let field = payload.fields.first(where: { normalizedKey(for: $0.name) == titleFieldKey }),
+              let field = payload.fields.first(where: {
+                  $0.normalizedKey == titleFieldKey.normalizedFieldKey
+              }),
+              !field.isEffectivelySensitive,
               !field.trimmedValue.isEmpty else {
             return payload.displayTitle
         }
-        let normalizedFieldName = normalizedKey(for: field.name)
+        let normalizedFieldName = field.normalizedKey
         if ["content", "body", "text", "note"].contains(normalizedFieldName) {
             return field.value.displayTitleCandidate() ?? payload.displayTitle
         }
@@ -1392,20 +1681,33 @@ private extension MainWindow {
         if shard.encryptionMode != .none {
             return "shield.lefthalf.filled"
         }
-        switch modeName(for: shard).lowercased() {
+        return iconName(forMode: modeName(for: shard))
+    }
+
+    func iconName(forMode modeName: String) -> String {
+        switch modeName.lowercased() {
         case "password": return "key.fill"
         case "token": return "network.badge.shield.half.filled"
+        case "license", "license key": return "key.viewfinder"
         case "shard", "note": return "triangle"
         default: return "doc.text"
         }
     }
 
-    func normalizedKey(for name: String) -> String {
-        name.lowercased().replacingOccurrences(of: " ", with: "_")
+    func categoryName(for shard: Shard) -> String {
+        collections.first(where: { $0.id == effectiveCollectionID(for: shard) })?.name
+            ?? VaultContainer.Defaults.shardsCollectionName
     }
 
-    func categoryName(for shard: Shard) -> String {
-        collections.first(where: { $0.id == shard.collectionId })?.name ?? VaultContainer.Defaults.shardsCollectionName
+    func effectiveCollectionID(for shard: Shard) -> String? {
+        if let collectionID = shard.collectionId,
+           collectionID != VaultContainer.Defaults.allCollectionID,
+           collections.contains(where: { $0.id == collectionID }) {
+            return collectionID
+        }
+        return collections.first(where: {
+            $0.name.caseInsensitiveCompare(VaultContainer.Defaults.shardsCollectionName) == .orderedSame
+        })?.id
     }
 
     // MARK: Date formatters
@@ -1414,17 +1716,13 @@ private extension MainWindow {
         let calendar = Calendar.current
         let currentYear = calendar.component(.year, from: Date())
         let dateYear = calendar.component(.year, from: date)
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.dateFormat = currentYear == dateYear ? "d. MMM · HH:mm" : "dd.MM.yy"
-        return formatter.string(from: date)
+        return date.formatted(
+            currentYear == dateYear ? Self.listSameYearFormat : Self.listOtherYearFormat
+        )
     }
 
     func detailDateString(for date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.dateFormat = "d MMM yyyy · HH:mm"
-        return formatter.string(from: date)
+        date.formatted(Self.detailDateFormat)
     }
 
     // MARK: Save Strategy
@@ -1432,10 +1730,7 @@ private extension MainWindow {
     func markDirty(for shard: Shard) {
         isDirty = true
         dirtyShardID = shard.id
-        saveDebounceTask?.cancel()
-        saveDebounceTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1.5))
-            guard !Task.isCancelled else { return }
+        saveScheduler.schedule(after: .seconds(1.5)) {
             _ = persistPendingEdits()
         }
     }
@@ -1446,8 +1741,7 @@ private extension MainWindow {
 
     @discardableResult
     func persistPendingEdits() -> Bool {
-        saveDebounceTask?.cancel()
-        saveDebounceTask = nil
+        saveScheduler.cancel()
 
         if let dirtyShardID,
            let shard = shards.first(where: { $0.id == dirtyShardID }) {
@@ -1459,6 +1753,7 @@ private extension MainWindow {
             dirtyShardID = nil
             return true
         }
+        guard ensureVaultWritable(action: "Save") else { return false }
 
         do {
             try context.save()
@@ -1569,8 +1864,53 @@ private extension MainWindow {
         pendingPermanentDeleteIDs = eligibleIDs
     }
 
-    func permanentlyDelete(_ shardIDs: [String]) {
-        guard !shardIDs.isEmpty, persistPendingEdits() else { return }
+    func confirmPermanentDelete() {
+        let shardIDs = Array(pendingPermanentDeleteIDs)
+        guard !shardIDs.isEmpty else { return }
+        guard persistPendingEdits() else {
+            pendingPermanentDeleteIDs = []
+            return
+        }
+
+        // Detach every editor binding from the soon-to-be deleted IDs before
+        // starting the isolated transaction. Yielding gives SwiftUI a chance
+        // to render the empty detail state; correctness does not depend on it.
+        pendingPermanentDeleteIDs = []
+        prepareForPermanentDeletion(shardIDs)
+        Task { @MainActor in
+            await Task.yield()
+            permanentlyDelete(shardIDs, pendingEditsAreSaved: true)
+        }
+    }
+
+    func prepareForPermanentDeletion(_ shardIDs: [String]) {
+        let deletedIDs = Set(shardIDs)
+        guard !deletedIDs.isEmpty else { return }
+
+        if let dirtyShardID, deletedIDs.contains(dirtyShardID) {
+            saveScheduler.cancel()
+            isDirty = false
+            self.dirtyShardID = nil
+        }
+        if let prompt = protectionPrompt, deletedIDs.contains(prompt.shardID) {
+            resetProtectionPrompt()
+        }
+        if let recentCaptureID, deletedIDs.contains(recentCaptureID) {
+            RecentCaptureStore.shared.clear(ifMatching: recentCaptureID)
+        }
+        pendingPermanentDeleteIDs.subtract(deletedIDs)
+        selectedShardIDs.subtract(deletedIDs)
+        if selectedShardIDs.isEmpty {
+            if isEditorFocused {
+                exitEditorFocus()
+            }
+            showUnlockAlert = false
+        }
+    }
+
+    func permanentlyDelete(_ shardIDs: [String], pendingEditsAreSaved: Bool = false) {
+        guard !shardIDs.isEmpty else { return }
+        guard pendingEditsAreSaved || persistPendingEdits() else { return }
         do {
             let receipt = try VaultRepository.shared.permanentlyDelete(
                 shardIDs: shardIDs,
@@ -1588,11 +1928,33 @@ private extension MainWindow {
                 showOperationNotice("Skipped \(skippedCount) unavailable \(skippedCount == 1 ? "shard" : "shards")")
             }
         } catch {
+            let existingIDs = Set(shardIDs.filter { id in
+                shards.contains(where: { $0.id == id })
+            })
+            if !existingIDs.isEmpty {
+                selectedShardIDs = existingIDs
+                activeFilter = .trash
+            }
             operationAlert = VaultOperationAlert(title: "Unable to Delete", message: error.localizedDescription)
         }
     }
 
+    func ensureVaultWritable(action: String) -> Bool {
+        guard VaultContainer.shared.isPersistentStoreAvailable else {
+            operationAlert = VaultOperationAlert(
+                title: "Unable to \(action)",
+                message: "The persistent vault is unavailable. Shards did not write this change to temporary storage."
+            )
+            return false
+        }
+        return true
+    }
+
     func saveDirectChange(action: String) {
+        guard ensureVaultWritable(action: action) else {
+            context.rollback()
+            return
+        }
         do {
             try context.save()
         } catch {
@@ -1609,6 +1971,19 @@ private extension MainWindow {
             guard !Task.isCancelled else { return }
             operationNotice = nil
         }
+    }
+
+    func openPendingSpotlightShardIfNeeded() {
+        guard let shardID = SpotlightOpenRequestStore.shared.peek() else { return }
+        openShard(withID: shardID)
+    }
+
+    func openShard(withID shardID: String) {
+        guard let shard = shards.first(where: { $0.id == shardID }) else { return }
+        searchText = ""
+        activeFilter = shard.deletedAt == nil ? .shards : .trash
+        selectedShardIDs = [shardID]
+        SpotlightOpenRequestStore.shared.clear(ifMatching: shardID)
     }
 
     func openRecentCapture() {
@@ -1655,6 +2030,12 @@ private extension MainWindow {
     }
 
     func presentProtectionPrompt(_ purpose: ProtectionPrompt.Purpose, for shard: Shard) {
+        switch purpose {
+        case .protect, .removeProtection:
+            guard persistPendingEdits() else { return }
+        case .unlockProtected:
+            break
+        }
         protectionPassword = ""
         protectionPasswordConfirmation = ""
         protectionPromptMessage = nil
@@ -1684,14 +2065,17 @@ private extension MainWindow {
                 try protection.protect(shard, password: protectionPassword)
             case .unlockProtected:
                 try protection.unlockProtectedShard(shard, password: protectionPassword)
+                resetProtectionPrompt()
+                return
             case .removeProtection:
                 try protection.removeProtection(from: shard, password: protectionPassword)
             }
 
-            shard.updatedAt = Date()
             try context.save()
             resetProtectionPrompt()
         } catch {
+            context.rollback()
+            protection.lockShardSession(shard)
             protectionPromptMessage = error.localizedDescription
         }
     }
@@ -1714,7 +2098,10 @@ private extension MainWindow {
     }
 
     func createTag(name: String, symbol: String, colorHex: String, on shard: Shard) {
-        guard !name.isEmpty, persistPendingEdits() else { return }
+        guard ensureVaultWritable(action: "Create Tag"),
+              !name.isEmpty,
+              persistPendingEdits()
+        else { return }
         if let existingTag = assignableTags.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
             toggleTag(existingTag, on: shard)
         } else {
@@ -1734,7 +2121,10 @@ private extension MainWindow {
     }
 
     func duplicate(_ shard: Shard) {
-        guard persistPendingEdits(), let accessibleText = accessiblePayloadText(for: shard) else { return }
+        guard ensureVaultWritable(action: "Duplicate"),
+              persistPendingEdits(),
+              let accessibleText = accessiblePayloadText(for: shard)
+        else { return }
         let newShard = Shard(
             collectionId: shard.collectionId,
             tagIds: shard.tagIds,
@@ -1742,19 +2132,18 @@ private extension MainWindow {
             displayName: shard.displayName.map { $0 + " (Copy)" },
             payload: shard.payload
         )
-
-        newShard.payload = (try? protection.duplicatedPayloadForSession(
-            from: shard,
-            to: newShard,
-            plaintext: accessibleText
-        )) ?? shard.payload
-
-        context.insert(newShard)
         do {
+            newShard.payload = try protection.duplicatedPayloadForSession(
+                from: shard,
+                to: newShard,
+                plaintext: accessibleText
+            )
+            context.insert(newShard)
             try context.save()
             withAnimation(.snappy(duration: 0.2)) { selectedShardIDs = [newShard.id] }
         } catch {
             context.rollback()
+            protection.forgetShardSessions(withIDs: [newShard.id])
             operationAlert = VaultOperationAlert(title: "Unable to Duplicate", message: error.localizedDescription)
         }
     }
@@ -1768,29 +2157,59 @@ private extension MainWindow {
     }
 
     func createNewShard() {
-        guard persistPendingEdits() else { return }
+        guard ensureVaultWritable(action: "Create Shard"), persistPendingEdits() else { return }
         let mode = protection.desiredEncryptionModeForNewShard()
         if mode == .global, protection.requiresGlobalUnlock {
             globalUnlockMessage = "Unlock the vault before creating a new shard."
             return
         }
-        let shardsCollectionId = collections.first(where: {
+        let defaultCollectionID = collections.first(where: {
             $0.name == VaultContainer.Defaults.shardsCollectionName
         })?.id
+        var targetCollectionID = defaultCollectionID
+        var initialTagIDs: [String] = []
+        var shouldShowAllAfterCreation = false
+
+        switch activeFilter {
+        case let .category(collectionID):
+            if collections.contains(where: { $0.id == collectionID }) {
+                targetCollectionID = collectionID
+            } else {
+                shouldShowAllAfterCreation = true
+            }
+        case let .tag(tagID):
+            if let tag = tags.first(where: { $0.id == tagID }),
+               tag.name.caseInsensitiveCompare(lockedTagName) != .orderedSame {
+                initialTagIDs = [tagID]
+            } else {
+                shouldShowAllAfterCreation = true
+            }
+        case .trash, .pinnedShard:
+            shouldShowAllAfterCreation = true
+        case .shards:
+            break
+        }
+
         let payload = PresetPayload(presetType: "Shard", fields: [
             PresetField(name: "Content", value: "", isRequired: true)
         ])
         let payloadJSON = (try? JSONEncoder().encode(payload)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        let finalPayload = (try? protection.encryptPayloadForPersistence(payloadJSON, mode: mode)) ?? payloadJSON
-        let shard = Shard(
-            collectionId: shardsCollectionId,
-            encryptionMode: mode,
-            payload: finalPayload
-        )
-        context.insert(shard)
         do {
+            let finalPayload = try protection.encryptPayloadForPersistence(payloadJSON, mode: mode)
+            let shard = Shard(
+                collectionId: targetCollectionID,
+                tagIds: initialTagIDs,
+                encryptionMode: mode,
+                payload: finalPayload
+            )
+            context.insert(shard)
             try context.save()
-            withAnimation(.snappy(duration: 0.2)) { selectedShardIDs = [shard.id] }
+            withAnimation(.snappy(duration: reduceMotion ? 0 : 0.2)) {
+                if shouldShowAllAfterCreation {
+                    activeFilter = .shards
+                }
+                selectedShardIDs = [shard.id]
+            }
         } catch {
             context.rollback()
             operationAlert = VaultOperationAlert(title: "Unable to Create Shard", message: error.localizedDescription)

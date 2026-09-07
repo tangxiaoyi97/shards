@@ -18,6 +18,7 @@ class VaultContainer {
 
     let container: ModelContainer
     private(set) var startupIssue: String?
+    private(set) var isPersistentStoreAvailable = true
     static let vaultDirectory = FileManager.default.urls(
         for: .applicationSupportDirectory,
         in: .userDomainMask
@@ -29,19 +30,29 @@ class VaultContainer {
     private init() {
         let schema = Schema([Shard.self, ShardCollection.self, Tag.self, PresetTemplate.self, ShardAttachment.self])
         let config = Self.makeConfiguration(schema: schema)
+        let createdContainer: ModelContainer
         do {
-            container = try ModelContainer(for: schema, configurations: [config])
-            seedDefaultsIfNeeded()
+            createdContainer = try ModelContainer(for: schema, configurations: [config])
         } catch {
             do {
-                startupIssue = "Shards could not open the persistent store and is using a temporary in-memory vault."
+                isPersistentStoreAvailable = false
+                startupIssue = "Shards could not open the persistent store. Editing is disabled so no temporary data can be mistaken for a successful save."
                 let fallbackConfig = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
-                let recreatedContainer = try ModelContainer(for: schema, configurations: [fallbackConfig])
-                container = recreatedContainer
-                seedDefaultsIfNeeded()
+                createdContainer = try ModelContainer(for: schema, configurations: [fallbackConfig])
             } catch {
                 fatalError("Failed to instantiate SwiftData ModelContainer: \(String(describing: error))")
             }
+        }
+        container = createdContainer
+
+        guard isPersistentStoreAvailable else { return }
+        do {
+            try ProtectionService.shared.recoverPendingConfiguration(context: container.mainContext)
+            try seedDefaultsIfNeeded()
+        } catch {
+            container.mainContext.rollback()
+            isPersistentStoreAvailable = false
+            startupIssue = "Shards opened the vault but could not validate its startup data. Editing is disabled to avoid partial migrations. \(error.localizedDescription)"
         }
     }
 
@@ -51,11 +62,11 @@ class VaultContainer {
         return ModelConfiguration(schema: schema, url: storeURL)
     }
 
-    private func seedDefaultsIfNeeded() {
+    private func seedDefaultsIfNeeded() throws {
         let context = container.mainContext
         var needsSave = false
 
-        if let count = try? context.fetchCount(FetchDescriptor<ShardCollection>()), count == 0 {
+        if try context.fetchCount(FetchDescriptor<ShardCollection>()) == 0 {
             [
                 ShardCollection(id: Defaults.allCollectionID, name: "All Shards", icon: "tray.full"),
                 ShardCollection(name: Defaults.shardsCollectionName, icon: Defaults.shardsCollectionIcon),
@@ -65,7 +76,7 @@ class VaultContainer {
             needsSave = true
         }
 
-        let tags = (try? context.fetch(FetchDescriptor<Tag>())) ?? []
+        let tags = try context.fetch(FetchDescriptor<Tag>())
         if !tags.contains(where: { $0.name.caseInsensitiveCompare(Defaults.clipboardTagName) == .orderedSame }) {
             context.insert(Tag(name: Defaults.clipboardTagName, colorHex: "#D97706", symbol: "paperclip", isSystem: true))
             needsSave = true
@@ -83,31 +94,31 @@ class VaultContainer {
             needsSave = true
         }
 
-        if let templateCount = try? context.fetchCount(FetchDescriptor<PresetTemplate>()), templateCount == 0 {
+        if try context.fetchCount(FetchDescriptor<PresetTemplate>()) == 0 {
             defaultTemplates().forEach(context.insert)
             needsSave = true
         }
 
-        if seedWelcomeShardsIfNeeded(context: context) {
+        if try seedWelcomeShardsIfNeeded(context: context) {
             needsSave = true
         }
 
-        if normalizeStoredDefaults(context: context) {
+        if try normalizeStoredDefaults(context: context) {
             needsSave = true
         }
 
         if needsSave {
-            try? context.save()
+            try context.save()
         }
     }
 
-    private func seedWelcomeShardsIfNeeded(context: ModelContext) -> Bool {
-        guard let shardCount = try? context.fetchCount(FetchDescriptor<Shard>()), shardCount == 0 else {
+    private func seedWelcomeShardsIfNeeded(context: ModelContext) throws -> Bool {
+        guard try context.fetchCount(FetchDescriptor<Shard>()) == 0 else {
             return false
         }
 
-        let collections = (try? context.fetch(FetchDescriptor<ShardCollection>())) ?? []
-        let tags = (try? context.fetch(FetchDescriptor<Tag>())) ?? []
+        let collections = try context.fetch(FetchDescriptor<ShardCollection>())
+        let tags = try context.fetch(FetchDescriptor<Tag>())
         let defaultCollectionId = collections.first(where: {
             $0.name.caseInsensitiveCompare(Defaults.shardsCollectionName) == .orderedSame
         })?.id ?? Defaults.allCollectionID
@@ -171,7 +182,7 @@ class VaultContainer {
 
     private func defaultTemplates() -> [PresetTemplate] {
         let shardSchema = PresetTemplateSchema(
-            version: 1,
+            version: PresetTemplateSchema.currentVersion,
             summary: "General-purpose shard for freeform notes, snippets, and uncategorized text.",
             useCases: ["clipboard captures", "ideas", "draft notes"],
             outputNotes: "Prefer this when the input does not strongly match a more structured template.",
@@ -192,7 +203,7 @@ class VaultContainer {
         )
 
         let passwordSchema = PresetTemplateSchema(
-            version: 1,
+            version: PresetTemplateSchema.currentVersion,
             summary: "Credential record for a login account.",
             useCases: ["website login", "app credentials", "service credentials"],
             outputNotes: "Use for username or email based credentials with an optional note.",
@@ -208,7 +219,7 @@ class VaultContainer {
         )
 
         let tokenSchema = PresetTemplateSchema(
-            version: 1,
+            version: PresetTemplateSchema.currentVersion,
             summary: "Machine token, API key, or bearer credential.",
             useCases: ["API key", "bearer token", "service integration token"],
             outputNotes: "Use for secrets intended for programmatic access instead of human login.",
@@ -252,12 +263,12 @@ class VaultContainer {
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
-    private func normalizeStoredDefaults(context: ModelContext) -> Bool {
+    private func normalizeStoredDefaults(context: ModelContext) throws -> Bool {
         var didChange = false
-        let collections = (try? context.fetch(FetchDescriptor<ShardCollection>())) ?? []
-        let templates = (try? context.fetch(FetchDescriptor<PresetTemplate>())) ?? []
-        let tags = (try? context.fetch(FetchDescriptor<Tag>())) ?? []
-        let shards = (try? context.fetch(FetchDescriptor<Shard>())) ?? []
+        let collections = try context.fetch(FetchDescriptor<ShardCollection>())
+        let templates = try context.fetch(FetchDescriptor<PresetTemplate>())
+        let tags = try context.fetch(FetchDescriptor<Tag>())
+        let shards = try context.fetch(FetchDescriptor<Shard>())
 
         if let legacyShardsCollection = collections.first(where: { $0.name == Defaults.shardsCollectionLegacyName }) {
             legacyShardsCollection.name = Defaults.shardsCollectionName
@@ -269,6 +280,31 @@ class VaultContainer {
            shardsCollection.icon != Defaults.shardsCollectionIcon {
             shardsCollection.icon = Defaults.shardsCollectionIcon
             didChange = true
+        }
+
+        if let shardsCollection = collections.first(where: {
+            $0.name.caseInsensitiveCompare(Defaults.shardsCollectionName) == .orderedSame
+        }) {
+            let validCollectionIDs = Set(
+                collections
+                    .filter { $0.id != Defaults.allCollectionID }
+                    .map(\.id)
+            )
+            for shard in shards where shard.collectionId.map({
+                !validCollectionIDs.contains($0)
+            }) ?? true {
+                shard.collectionId = shardsCollection.id
+                didChange = true
+            }
+        }
+
+        for shard in shards {
+            var seenTagIDs = Set<String>()
+            let uniqueTagIDs = shard.tagIds.filter { seenTagIDs.insert($0).inserted }
+            if uniqueTagIDs != shard.tagIds {
+                shard.tagIds = uniqueTagIDs
+                didChange = true
+            }
         }
 
         for template in templates {
@@ -313,11 +349,9 @@ class VaultContainer {
                 continue
             }
 
-            let normalizedSchema = encode(schema: template.schema)
-            if template.schemaFieldsJSON != normalizedSchema {
-                template.schemaFieldsJSON = normalizedSchema
-                didChange = true
-            }
+            // Custom schemas are intentionally preserved byte-for-byte here.
+            // Decode/encode normalization would discard forward-compatible keys
+            // (for example future validation or options metadata).
         }
 
         let collectionByName = Dictionary(uniqueKeysWithValues: collections.map { ($0.name, $0) })
@@ -339,10 +373,10 @@ class VaultContainer {
         }
 
         for shard in shards {
-            guard let data = shard.payload.data(using: .utf8),
-                  var payload = try? JSONDecoder().decode(PresetPayload.self, from: data) else {
+            guard case let .decoded(decodedPayload) = PresetPayload.decoding(shard.payload) else {
                 continue
             }
+            var payload = decodedPayload
 
             var payloadChanged = false
             if payload.presetType.caseInsensitiveCompare("Note") == .orderedSame {
@@ -427,12 +461,17 @@ protocol VaultRepositoryProtocol {
 
 @MainActor
 final class VaultRepository: VaultRepositoryProtocol {
-    static let shared = VaultRepository(container: VaultContainer.shared.container)
+    static let shared = VaultRepository(
+        container: VaultContainer.shared.container,
+        writesAllowed: { VaultContainer.shared.isPersistentStoreAvailable }
+    )
 
     private let container: ModelContainer
+    private let writesAllowed: () -> Bool
 
-    init(container: ModelContainer) {
+    init(container: ModelContainer, writesAllowed: @escaping () -> Bool = { true }) {
         self.container = container
+        self.writesAllowed = writesAllowed
     }
 
     @discardableResult
@@ -442,6 +481,7 @@ final class VaultRepository: VaultRepositoryProtocol {
         tagIds: [String] = [],
         encryptionMode: EncryptionMode = .none
     ) throws -> Shard {
+        try ensureWritesAllowed()
         let encodedPayload: String
 
         if payload.isRaw {
@@ -459,31 +499,39 @@ final class VaultRepository: VaultRepositoryProtocol {
             finalPayload = try ProtectionService.shared.encryptPayloadForPersistence(encodedPayload, mode: encryptionMode)
         }
 
+        let isolatedContext = ModelContext(container)
         var calculatedDisplayName: String? = nil
-        let presetTypeName = payload.presetType
         let fetchDescriptor = FetchDescriptor<PresetTemplate>()
-        if let templates = try? container.mainContext.fetch(fetchDescriptor),
-           let match = templates.first(where: { $0.name == presetTypeName }) {
-            let schema = match.schema
-            if let format = schema.displayFormat {
-                var formattedName = format
-                for field in payload.fields {
-                    let keyPattern = "{\(field.name)}"
-                    formattedName = formattedName.replacingOccurrences(of: keyPattern, with: field.value.trimmingCharacters(in: .whitespacesAndNewlines), options: .caseInsensitive)
-                }
-                calculatedDisplayName = formattedName
-            }
+        let templates = try isolatedContext.fetch(fetchDescriptor)
+        if let match = templates.matchingTemplate(for: payload) {
+            calculatedDisplayName = match.schema.safeDisplayName(for: payload)
+        }
+
+        let resolvedCollectionID: String?
+        if collectionId == nil || collectionId == VaultContainer.Defaults.allCollectionID {
+            let collections = try isolatedContext.fetch(FetchDescriptor<ShardCollection>())
+            resolvedCollectionID = collections.first(where: {
+                $0.name.caseInsensitiveCompare(VaultContainer.Defaults.shardsCollectionName) == .orderedSame
+            })?.id
+        } else {
+            resolvedCollectionID = collectionId
         }
 
         let shard = Shard(
-            collectionId: collectionId,
+            collectionId: resolvedCollectionID,
             tagIds: tagIds,
             encryptionMode: encryptionMode,
             displayName: calculatedDisplayName,
             payload: finalPayload
         )
-        container.mainContext.insert(shard)
-        try container.mainContext.save()
+        isolatedContext.insert(shard)
+        do {
+            try isolatedContext.save()
+        } catch {
+            isolatedContext.rollback()
+            throw error
+        }
+
         return shard
     }
 
@@ -502,7 +550,8 @@ final class VaultRepository: VaultRepositoryProtocol {
         to shardIDs: [String],
         lockedTagID: String? = nil
     ) throws -> ShardBatchReceipt {
-        try ShardBatchService(context: container.mainContext).apply(
+        try ensureWritesAllowed()
+        return try ShardBatchService(context: container.mainContext).apply(
             operation,
             to: shardIDs,
             lockedTagID: lockedTagID
@@ -513,6 +562,7 @@ final class VaultRepository: VaultRepositoryProtocol {
         _ receipt: ShardBatchReceipt,
         direction: ShardBatchReplayDirection
     ) throws {
+        try ensureWritesAllowed()
         guard !container.mainContext.hasChanges else {
             throw ShardBatchError.pendingChanges
         }
@@ -524,6 +574,7 @@ final class VaultRepository: VaultRepositoryProtocol {
         to shardIDs: [String],
         lockedTagID: String? = nil
     ) throws -> ShardBatchReceipt {
+        try ensureWritesAllowed()
         let isolatedContext = ModelContext(container)
         return try ShardBatchService(context: isolatedContext).apply(
             operation,
@@ -536,32 +587,54 @@ final class VaultRepository: VaultRepositoryProtocol {
         _ receipt: ShardBatchReceipt,
         direction: ShardBatchReplayDirection
     ) throws {
+        try ensureWritesAllowed()
         let isolatedContext = ModelContext(container)
         try ShardBatchService(context: isolatedContext).replay(receipt, direction: direction)
     }
 
     func shard(withID id: String) throws -> Shard? {
-        try container.mainContext.fetch(FetchDescriptor<Shard>()).first(where: { $0.id == id })
+        let readContext = ModelContext(container)
+        return try readContext.fetch(FetchDescriptor<Shard>()).first(where: { $0.id == id })
     }
 
     func permanentlyDelete(
         shardIDs: [String],
         lockedTagID: String? = nil
     ) throws -> ShardPermanentDeleteReceipt {
-        try ShardBatchService(context: container.mainContext).permanentlyDelete(
+        try ensureWritesAllowed()
+        guard !container.mainContext.hasChanges else {
+            throw ShardBatchError.pendingChanges
+        }
+        let isolatedContext = ModelContext(container)
+        let receipt = try ShardBatchService(context: isolatedContext).permanentlyDelete(
             shardIDs: shardIDs,
             lockedTagID: lockedTagID
         )
+        NotificationCenter.default.post(
+            name: .shardsWerePermanentlyDeleted,
+            object: receipt.deletedIDs
+        )
+        ProtectionService.shared.forgetShardSessions(withIDs: receipt.deletedIDs)
+        return receipt
+    }
+
+    private func ensureWritesAllowed() throws {
+        guard writesAllowed() else {
+            throw VaultRepositoryError.storeUnavailable
+        }
     }
 }
 
 enum VaultRepositoryError: LocalizedError {
     case invalidEncoding
+    case storeUnavailable
 
     var errorDescription: String? {
         switch self {
         case .invalidEncoding:
             return "Unable to encode the shard payload."
+        case .storeUnavailable:
+            return "The persistent vault is unavailable. Shards did not write to temporary storage."
         }
     }
 }

@@ -5,7 +5,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    @Environment(\.modelContext) private var context
     @State private var selectedTab: SettingsTab = .general
+    @StateObject private var tagEditingCoordinator = TagEditingCoordinator.shared
     @AppStorage("custom_accent_hex") private var customAccentHex = ""
 
     enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
@@ -58,7 +60,7 @@ struct SettingsView: View {
 
             HStack(spacing: 0) {
                 SettingsSidebar(
-                    selection: $selectedTab,
+                    selection: guardedTabSelection,
                     accentColor: appAccentColor
                 )
 
@@ -68,8 +70,39 @@ struct SettingsView: View {
 
                 settingsDetail
             }
+
+            if !VaultContainer.shared.isPersistentStoreAvailable {
+                VaultUnavailableOverlay(
+                    detail: VaultContainer.shared.startupIssue
+                        ?? "Shards could not open its persistent store. Settings that change vault data are disabled."
+                )
+            }
         }
         .frame(minWidth: 780, idealWidth: 820, minHeight: 590, idealHeight: 640)
+        .onReceive(NotificationCenter.default.publisher(for: .vaultFlushRequested)) { notification in
+            guard let request = notification.object as? VaultFlushRequest else { return }
+            if !tagEditingCoordinator.commit(using: context) {
+                request.recordFailure("Tag changes could not be saved.")
+            }
+        }
+        .onDisappear {
+            _ = tagEditingCoordinator.commit(using: context)
+        }
+    }
+
+    private var guardedTabSelection: Binding<SettingsTab> {
+        Binding(
+            get: { selectedTab },
+            set: { nextTab in
+                guard nextTab != selectedTab else { return }
+                if selectedTab == .management,
+                   nextTab != .management,
+                   !tagEditingCoordinator.commit(using: context) {
+                    return
+                }
+                selectedTab = nextTab
+            }
+        )
     }
 
     private var settingsDetail: some View {
@@ -86,7 +119,7 @@ struct SettingsView: View {
                 case .general: GeneralSettingsView()
                 case .editor: EditorSettingsView()
                 case .appearance: PersonalizationSettingsView()
-                case .management: ManagementSettingsView()
+                case .management: ManagementSettingsView(coordinator: tagEditingCoordinator)
                 case .advanced: AdvancedSettingsView()
                 case .diagnostics: DiagnosticsSettingsView()
                 }
@@ -148,6 +181,8 @@ private struct GeneralSettingsView: View {
                 SettingsNote(text: "When hidden, the main window remains available from the menu bar and Quick Entry shortcut.")
             }
 
+            SpotlightSettingsCard()
+
             SettingsCard(
                 "About Shards",
                 icon: "info.circle",
@@ -206,6 +241,55 @@ private struct GeneralSettingsView: View {
                 )
             Text(desc)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct SpotlightSettingsCard: View {
+    @AppStorage(AppSettingKeys.spotlightIndexingEnabled) private var isEnabled = false
+    @ObservedObject private var spotlight = SpotlightIndexingService.shared
+
+    var body: some View {
+        SettingsCard(
+            "Spotlight Search",
+            icon: "magnifyingglass.circle.fill",
+            summary: "Find eligible shards from macOS Spotlight and open them directly in Shards."
+        ) {
+            Toggle(
+                "Show eligible shards in Spotlight",
+                isOn: Binding(
+                    get: { isEnabled },
+                    set: { enabled in
+                        isEnabled = enabled
+                        spotlight.setEnabled(enabled)
+                    }
+                )
+            )
+
+            LabeledContent("Status") {
+                HStack(spacing: 7) {
+                    if spotlight.isWorking {
+                        ProgressView()
+                            .controlSize(.mini)
+                    }
+                    Text(spotlight.statusMessage)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+
+            if isEnabled {
+                Button("Rebuild Spotlight Index") {
+                    spotlight.rebuildNow()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(spotlight.isWorking)
+            }
+
+            SettingsNote(
+                text: "Spotlight keeps a local searchable copy of the title, category, tags, dates, and eligible text. Raw text is indexed in full unless it is protected, in a recognized sensitive category, or tagged Hidden or Locked. Trash, malformed structured content, and sensitive template fields are excluded. Category names are a convenience filter, not a security boundary."
+            )
         }
     }
 }
@@ -281,10 +365,205 @@ private struct EditorSettingsView: View {
 
 // MARK: - Management
 
+private struct TagEditDraft: Equatable {
+    var name: String
+    var symbol: String
+    var colorHex: String
+
+    var normalizedForPersistence: TagEditDraft {
+        let trimmedSymbol = symbol.trimmingCharacters(in: .whitespacesAndNewlines)
+        return TagEditDraft(
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            symbol: trimmedSymbol.isEmpty ? "tag.fill" : trimmedSymbol,
+            colorHex: colorHex
+        )
+    }
+}
+
+private struct SettingsTagSnapshot: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let symbol: String
+    let colorHex: String
+    let isSystem: Bool
+
+    var draft: TagEditDraft {
+        TagEditDraft(name: name, symbol: symbol, colorHex: colorHex)
+    }
+}
+
+@MainActor
+private final class TagEditingCoordinator: ObservableObject {
+    static let shared = TagEditingCoordinator()
+
+    @Published private(set) var drafts: [String: TagEditDraft] = [:]
+    @Published private(set) var deletingTagIDs: Set<String> = []
+    @Published private(set) var feedbackMessage: String?
+
+    private let saveScheduler = DebouncedSaveScheduler()
+
+    private init() {}
+
+    func displayedDraft(for tagID: String, fallback: TagEditDraft) -> TagEditDraft {
+        guard !deletingTagIDs.contains(tagID) else { return fallback }
+        return drafts[tagID] ?? fallback
+    }
+
+    func isDeleting(_ tagID: String) -> Bool {
+        deletingTagIDs.contains(tagID)
+    }
+
+    func updateDraft(
+        tagID: String,
+        fallback: TagEditDraft,
+        name: String? = nil,
+        symbol: String? = nil,
+        colorHex: String? = nil,
+        using mainContext: ModelContext
+    ) {
+        guard !deletingTagIDs.contains(tagID) else { return }
+
+        var draft = drafts[tagID] ?? fallback
+        if let name { draft.name = name }
+        if let symbol { draft.symbol = symbol }
+        if let colorHex { draft.colorHex = colorHex }
+        drafts[tagID] = draft
+        feedbackMessage = nil
+
+        saveScheduler.schedule(after: .milliseconds(350)) { [weak self] in
+            guard let self else { return }
+            _ = self.commit(using: mainContext)
+        }
+    }
+
+    @discardableResult
+    func commit(using mainContext: ModelContext) -> Bool {
+        saveScheduler.cancel()
+        guard !drafts.isEmpty else { return true }
+        guard VaultContainer.shared.isPersistentStoreAvailable else {
+            feedbackMessage = "The persistent vault is unavailable. Tag changes were not written."
+            return false
+        }
+
+        let submittedDrafts = drafts.filter { !deletingTagIDs.contains($0.key) }
+        guard !submittedDrafts.isEmpty else { return true }
+        guard submittedDrafts.values.allSatisfy({
+            !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            feedbackMessage = "Tag names cannot be empty."
+            return false
+        }
+
+        let transactionContext = ModelContext(mainContext.container)
+        do {
+            let storedTags = try transactionContext.fetch(FetchDescriptor<Tag>())
+            let storedByID = storedTags.reduce(into: [String: Tag]()) { result, tag in
+                result[tag.id] = tag
+            }
+            for (tagID, draft) in submittedDrafts {
+                guard let storedTag = storedByID[tagID] else { continue }
+                let normalized = draft.normalizedForPersistence
+                storedTag.name = normalized.name
+                storedTag.symbol = normalized.symbol
+                storedTag.colorHex = normalized.colorHex
+            }
+            try transactionContext.save()
+        } catch {
+            transactionContext.rollback()
+            feedbackMessage = "Tag changes remain open. \(error.localizedDescription)"
+            return false
+        }
+
+        do {
+            let refreshedTags = try mainContext.fetch(FetchDescriptor<Tag>())
+            let refreshedValues = refreshedTags.reduce(into: [String: TagEditDraft]()) { result, tag in
+                result[tag.id] = TagEditDraft(
+                    name: tag.name,
+                    symbol: tag.symbol,
+                    colorHex: tag.colorHex
+                )
+            }
+            clearSynchronizedDrafts(submittedDrafts, persistedValues: refreshedValues)
+
+            let remainingSubmittedIDs = Set(submittedDrafts.keys).intersection(drafts.keys)
+            guard remainingSubmittedIDs.isEmpty else {
+                feedbackMessage = "Tag changes were saved, but the settings view has not refreshed yet."
+                return false
+            }
+
+            feedbackMessage = nil
+            return true
+        } catch {
+            feedbackMessage = "Tag changes were saved, but could not be refreshed. \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func reconcilePersistedValues(_ snapshots: [SettingsTagSnapshot]) {
+        let values = snapshots.reduce(into: [String: TagEditDraft]()) { result, snapshot in
+            result[snapshot.id] = snapshot.draft
+        }
+        clearSynchronizedDrafts(drafts, persistedValues: values)
+    }
+
+    func beginDeleting(_ tagID: String) -> Bool {
+        guard deletingTagIDs.insert(tagID).inserted else { return false }
+        saveScheduler.cancel()
+        return true
+    }
+
+    func markDeletionPersisted(_ tagID: String) {
+        drafts.removeValue(forKey: tagID)
+        feedbackMessage = nil
+    }
+
+    func cancelDeletion(_ tagID: String, message: String) {
+        deletingTagIDs.remove(tagID)
+        feedbackMessage = message
+    }
+
+    func reconcileDeletingTagIDs(existingTagIDs: Set<String>) {
+        deletingTagIDs.formIntersection(existingTagIDs)
+    }
+
+    func clearFeedback() {
+        feedbackMessage = nil
+    }
+
+    func showFeedback(_ message: String) {
+        feedbackMessage = message
+    }
+
+    private func clearSynchronizedDrafts(
+        _ candidates: [String: TagEditDraft],
+        persistedValues: [String: TagEditDraft]
+    ) {
+        let synchronizedIDs = candidates.compactMap { tagID, submittedDraft -> String? in
+            guard drafts[tagID] == submittedDraft,
+                  persistedValues[tagID] == submittedDraft.normalizedForPersistence else {
+                return nil
+            }
+            return tagID
+        }
+        for tagID in synchronizedIDs {
+            drafts.removeValue(forKey: tagID)
+        }
+    }
+}
+
+@MainActor
+enum SettingsPendingEditCoordinator {
+    static func flush(using context: ModelContext) -> Bool {
+        TagEditingCoordinator.shared.commit(using: context)
+    }
+}
+
 private struct ManagementSettingsView: View {
     @Environment(\.modelContext) private var context
     @Query(sort: \Tag.name) private var tags: [Tag]
     @Query(sort: \PresetTemplate.orderIndex) private var templates: [PresetTemplate]
+
+    @ObservedObject var coordinator: TagEditingCoordinator
 
     @AppStorage("default_quick_entry_mode") private var defaultQuickEntryMode = "template:shard"
     @AppStorage("status_bar_double_click_add_tags") private var statusBarDoubleClickAddTags = true
@@ -293,24 +572,27 @@ private struct ManagementSettingsView: View {
     @State private var newTagName = ""
     @State private var newTagColor = "#4F46E5"
     @State private var newTagSymbol = "tag.fill"
-    @State private var selectedTemplateId: String?
-    @State private var pendingImportedTemplate: PresetTemplate?
-    @State private var showReplaceAlert = false
-    @State private var importErrorMessage: String?
 
     private let hiddenTagNames = ["Password", "Token"]
 
-    private var editableTags: [Tag] {
-        tags.filter { !hiddenTagNames.contains($0.name) }
+    private var tagSnapshots: [SettingsTagSnapshot] {
+        tags.map {
+            SettingsTagSnapshot(
+                id: $0.id,
+                name: $0.name,
+                symbol: $0.symbol,
+                colorHex: $0.colorHex,
+                isSystem: $0.isSystem
+            )
+        }
+    }
+
+    private var editableTags: [SettingsTagSnapshot] {
+        tagSnapshots.filter { !hiddenTagNames.contains($0.name) }
     }
 
     private var doubleClickTagIDSet: Set<String> {
         Set(statusBarDoubleClickTagIDs.split(separator: ",").map(String.init))
-    }
-
-    private var selectedTemplate: PresetTemplate? {
-        guard let selectedTemplateId else { return nil }
-        return templates.first(where: { $0.id == selectedTemplateId })
     }
 
     var body: some View {
@@ -337,9 +619,10 @@ private struct ManagementSettingsView: View {
                 if statusBarDoubleClickAddTags && !editableTags.isEmpty {
                     Divider()
                     ForEach(editableTags) { tag in
+                        let tagID = tag.id
                         Toggle(isOn: Binding(
-                            get: { doubleClickTagIDSet.contains(tag.id) },
-                            set: { updateDoubleClickTag(tagID: tag.id, isEnabled: $0) }
+                            get: { doubleClickTagIDSet.contains(tagID) },
+                            set: { updateDoubleClickTag(tagID: tagID, isEnabled: $0) }
                         )) {
                             Label(tag.name, systemImage: tag.symbol)
                         }
@@ -354,26 +637,71 @@ private struct ManagementSettingsView: View {
                 summary: "Rename, recolor, or add labels used across the vault."
             ) {
                 ForEach(editableTags) { tag in
+                    let tagID = tag.id
+                    let fallback = tag.draft
+                    let displayedDraft = coordinator.displayedDraft(for: tagID, fallback: fallback)
+                    let isDeleting = coordinator.isDeleting(tagID)
+
                     HStack(spacing: 10) {
                         SymbolPickerButton(symbol: Binding(
-                            get: { tag.symbol },
-                            set: { tag.symbol = $0; try? context.save() }
-                        ), color: Color(hex: tag.colorHex) ?? .secondary)
+                            get: {
+                                guard !coordinator.isDeleting(tagID) else { return fallback.symbol }
+                                return coordinator.displayedDraft(for: tagID, fallback: fallback).symbol
+                            },
+                            set: { newSymbol in
+                                guard !coordinator.isDeleting(tagID) else { return }
+                                coordinator.updateDraft(
+                                    tagID: tagID,
+                                    fallback: fallback,
+                                    symbol: newSymbol,
+                                    using: context
+                                )
+                            }
+                        ), color: Color(hex: displayedDraft.colorHex) ?? .secondary)
 
                         TextField("Name", text: Binding(
-                            get: { tag.name },
-                            set: { tag.name = $0; try? context.save() }
+                            get: {
+                                guard !coordinator.isDeleting(tagID) else { return fallback.name }
+                                return coordinator.displayedDraft(for: tagID, fallback: fallback).name
+                            },
+                            set: { newName in
+                                guard !coordinator.isDeleting(tagID) else { return }
+                                coordinator.updateDraft(
+                                    tagID: tagID,
+                                    fallback: fallback,
+                                    name: newName,
+                                    using: context
+                                )
+                            }
                         ))
                         .frame(maxWidth: .infinity)
+                        .onSubmit { _ = coordinator.commit(using: context) }
 
                         ColorPicker("", selection: Binding(
-                            get: { Color(hex: tag.colorHex) ?? .blue },
-                            set: { tag.colorHex = $0.toHex() ?? tag.colorHex; try? context.save() }
+                            get: {
+                                guard !coordinator.isDeleting(tagID) else {
+                                    return Color(hex: fallback.colorHex) ?? .blue
+                                }
+                                return Color(
+                                    hex: coordinator.displayedDraft(for: tagID, fallback: fallback).colorHex
+                                ) ?? .blue
+                            },
+                            set: { newColor in
+                                guard !coordinator.isDeleting(tagID) else { return }
+                                coordinator.updateDraft(
+                                    tagID: tagID,
+                                    fallback: fallback,
+                                    colorHex: newColor.toHex() ?? fallback.colorHex,
+                                    using: context
+                                )
+                            }
                         ))
                         .labelsHidden()
 
                         if !tag.isSystem {
-                            Button(role: .destructive) { delete(tag: tag) } label: {
+                            Button(role: .destructive) {
+                                delete(tagID: tagID, isSystem: tag.isSystem)
+                            } label: {
                                 Image(systemName: "minus.circle.fill")
                                     .font(.system(size: 14))
                                     .foregroundStyle(.red.opacity(0.6))
@@ -381,6 +709,7 @@ private struct ManagementSettingsView: View {
                             .buttonStyle(.plain)
                         }
                     }
+                    .disabled(isDeleting)
 
                     if tag.id != editableTags.last?.id {
                         Divider()
@@ -410,16 +739,22 @@ private struct ManagementSettingsView: View {
                     .buttonStyle(.plain)
                     .disabled(newTagName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+
+                if let feedbackMessage = coordinator.feedbackMessage {
+                    Text(feedbackMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
         }
         .onAppear {
             seedStatusBarTagsIfNeeded()
         }
-        .alert("Replace Existing Template?", isPresented: $showReplaceAlert, presenting: pendingImportedTemplate) { pending in
-            Button("Replace", role: .destructive) { replaceExistingTemplate(with: pending) }
-            Button("Cancel", role: .cancel) { pendingImportedTemplate = nil }
-        } message: { pending in
-            Text("A template named \(pending.name) already exists. Replace it with the pasted version?")
+        .onChange(of: tags.map(\.id), initial: true) { _, tagIDs in
+            coordinator.reconcileDeletingTagIDs(existingTagIDs: Set(tagIDs))
+        }
+        .onChange(of: tagSnapshots, initial: true) { _, snapshots in
+            coordinator.reconcilePersistedValues(snapshots)
         }
     }
 
@@ -438,39 +773,63 @@ private struct ManagementSettingsView: View {
 
     private func addTag() {
         let trimmedName = newTagName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty else { return }
+        guard VaultContainer.shared.isPersistentStoreAvailable,
+              !trimmedName.isEmpty,
+              coordinator.commit(using: context)
+        else { return }
         let trimmedSymbol = newTagSymbol.trimmingCharacters(in: .whitespacesAndNewlines)
         let tag = Tag(name: trimmedName, colorHex: newTagColor, symbol: trimmedSymbol.isEmpty ? "tag.fill" : trimmedSymbol)
-        context.insert(tag)
-        try? context.save()
-        newTagName = ""
-        newTagColor = "#4F46E5"
-        newTagSymbol = "tag.fill"
+        let transactionContext = ModelContext(context.container)
+        transactionContext.insert(tag)
+        do {
+            try transactionContext.save()
+            coordinator.clearFeedback()
+            newTagName = ""
+            newTagColor = "#4F46E5"
+            newTagSymbol = "tag.fill"
+        } catch {
+            transactionContext.rollback()
+            coordinator.showFeedback("The tag was not added. \(error.localizedDescription)")
+        }
     }
 
-    private func delete(tag: Tag) {
-        guard !tag.isSystem else { return }
-        let shards = (try? context.fetch(FetchDescriptor<Shard>())) ?? []
-        for shard in shards where shard.tagIds.contains(tag.id) {
-            shard.tagIds.removeAll(where: { $0 == tag.id })
+    private func delete(tagID: String, isSystem: Bool) {
+        guard VaultContainer.shared.isPersistentStoreAvailable,
+              !isSystem,
+              coordinator.commit(using: context),
+              coordinator.beginDeleting(tagID)
+        else { return }
+
+        let transactionContext = ModelContext(context.container)
+        do {
+            let storedTags = try transactionContext.fetch(FetchDescriptor<Tag>())
+            guard let storedTag = storedTags.first(where: { $0.id == tagID }) else {
+                coordinator.markDeletionPersisted(tagID)
+                return
+            }
+            guard !storedTag.isSystem else {
+                coordinator.cancelDeletion(tagID, message: "System tags cannot be deleted.")
+                return
+            }
+            let storedShards = try transactionContext.fetch(FetchDescriptor<Shard>())
+            for shard in storedShards where shard.tagIds.contains(tagID) {
+                shard.tagIds.removeAll(where: { $0 == tagID })
+            }
+            transactionContext.delete(storedTag)
+            try transactionContext.save()
+            coordinator.markDeletionPersisted(tagID)
+            var ids = doubleClickTagIDSet
+            ids.remove(tagID)
+            statusBarDoubleClickTagIDs = ids.sorted().joined(separator: ",")
+        } catch {
+            transactionContext.rollback()
+            coordinator.cancelDeletion(
+                tagID,
+                message: "The tag was not deleted. \(error.localizedDescription)"
+            )
         }
-        var ids = doubleClickTagIDSet
-        ids.remove(tag.id)
-        statusBarDoubleClickTagIDs = ids.sorted().joined(separator: ",")
-        context.delete(tag)
-        try? context.save()
     }
 
-    private func replaceExistingTemplate(with pending: PresetTemplate) {
-        if let existing = templates.first(where: { $0.name.caseInsensitiveCompare(pending.name) == .orderedSame }) {
-            existing.symbol = pending.symbol
-            existing.targetCollectionName = pending.targetCollectionName
-            existing.schemaFieldsJSON = pending.schemaFieldsJSON
-            try? context.save()
-            selectedTemplateId = existing.id
-        }
-        pendingImportedTemplate = nil
-    }
 }
 
 // MARK: - Advanced (Intelligence + Data + Templates)
@@ -490,16 +849,18 @@ private struct AdvancedSettingsView: View {
     @StateObject private var protection = ProtectionService.shared
     @State private var feedbackMessage: String?
     @State private var feedbackIsError = false
-    @State private var selectedTemplateId: String?
+    @State private var templateEditorDraft: TemplateEditorDraft?
     @State private var globalPassword = ""
     @State private var confirmGlobalPassword = ""
     @State private var unlockPassword = ""
     @State private var disablePassword = ""
     @State private var isConfirmingEmptyTrash = false
 
-    private var selectedTemplate: PresetTemplate? {
-        guard let selectedTemplateId else { return nil }
-        return templates.first(where: { $0.id == selectedTemplateId })
+    private var editableCollectionNames: [String] {
+        let names = collections
+            .filter { $0.id != VaultContainer.Defaults.allCollectionID }
+            .map(\.name)
+        return names.isEmpty ? [VaultContainer.Defaults.shardsCollectionName] : names
     }
 
     var body: some View {
@@ -629,6 +990,24 @@ private struct AdvancedSettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.tertiary)
 
+                        if !isBuiltinTemplate(template) {
+                            Button {
+                                templateEditorDraft = .editing(template)
+                            } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Edit Template")
+                        }
+
+                        Button {
+                            templateEditorDraft = .duplicating(template)
+                        } label: {
+                            Image(systemName: "plus.square.on.square")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Duplicate Template")
+
                         if template.name.caseInsensitiveCompare("Shard") != .orderedSame || templates.count > 1 {
                             Button(role: .destructive) { deleteTemplate(template) } label: {
                                 Image(systemName: "minus.circle.fill")
@@ -644,11 +1023,27 @@ private struct AdvancedSettingsView: View {
                     }
                 }
 
-                Button("Import Template from Clipboard") {
-                    importTemplate()
+                HStack(spacing: 10) {
+                    Menu("New Template") {
+                        Button("Structured Template") {
+                            templateEditorDraft = .blank(collectionName: editableCollectionNames[0])
+                        }
+                        Button("License Key Template") {
+                            templateEditorDraft = .licenseKey(collectionName: editableCollectionNames[0])
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Import from Clipboard") {
+                        importTemplate()
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
                 .controlSize(.small)
+
+                SettingsNote(
+                    text: "Schema v2 supports Text, Username, Email, URL, Phone, Number, Date, Long Text, Code, Secret, License Key, and forward-compatible custom field types."
+                )
 
                 if let feedbackMessage, !feedbackIsError {
                     Text(feedbackMessage)
@@ -717,17 +1112,44 @@ private struct AdvancedSettingsView: View {
         } message: {
             Text("This cannot be undone.")
         }
+        .sheet(item: $templateEditorDraft) { draft in
+            TemplateEditorView(
+                draft: draft,
+                collectionNames: editableCollectionNames,
+                existingTemplateNames: templates
+                    .filter { $0.id != draft.templateID }
+                    .map(\.name),
+                onSave: saveTemplate
+            )
+        }
     }
 
     private func emptyTrash() {
-        let trashed = shards.filter { $0.deletedAt != nil }
-        guard !trashed.isEmpty else { return }
-        for shard in trashed {
-            context.delete(shard)
+        let trashedIDs = shards.lazy.filter { $0.deletedAt != nil }.map(\.id)
+        guard !trashedIDs.isEmpty else { return }
+
+        do {
+            if context.hasChanges {
+                try context.save()
+            }
+            let lockedTagID = tags.first(where: { $0.name == "Locked" })?.id
+            let receipt = try VaultRepository.shared.permanentlyDelete(
+                shardIDs: Array(trashedIDs),
+                lockedTagID: lockedTagID
+            )
+            let skippedCount = receipt.skippedLockedIDs.count
+                + receipt.skippedLiveIDs.count
+                + receipt.missingIDs.count
+            if skippedCount > 0 {
+                feedbackMessage = "Permanently deleted \(receipt.deletedIDs.count) shard(s); skipped \(skippedCount) locked or unavailable."
+            } else {
+                feedbackMessage = "Permanently deleted \(receipt.deletedIDs.count) shard(s)."
+            }
+            feedbackIsError = false
+        } catch {
+            feedbackMessage = "Trash was not changed. \(error.localizedDescription)"
+            feedbackIsError = true
         }
-        try? context.save()
-        feedbackMessage = "Permanently deleted \(trashed.count) shard(s)."
-        feedbackIsError = false
     }
 
     private func enableGlobalProtection() {
@@ -740,6 +1162,12 @@ private struct AdvancedSettingsView: View {
         }
 
         do {
+            if context.hasChanges {
+                try context.save()
+            }
+            // Protection touches every visible Shard. The shared main context
+            // is clean at this point, so using it keeps mounted detail views in
+            // sync while ProtectionService still provides transactional rollback.
             try protection.enableGlobalProtection(password: normalized, context: context)
             globalPassword = ""
             confirmGlobalPassword = ""
@@ -767,6 +1195,9 @@ private struct AdvancedSettingsView: View {
     private func disableGlobalProtection() {
         feedbackMessage = nil
         do {
+            if context.hasChanges {
+                try context.save()
+            }
             try protection.disableGlobalProtection(password: disablePassword, context: context)
             disablePassword = ""
             feedbackMessage = "Global protection disabled."
@@ -797,28 +1228,132 @@ private struct AdvancedSettingsView: View {
             return
         }
         guard let data = trimmed.data(using: .utf8) else { return }
+        let transactionContext = ModelContext(context.container)
         do {
-            let imported = try JSONDecoder().decode(ImportedTemplate.self, from: data)
+            let imported = try ImportedTemplate(data: data)
+            if let validationMessage = imported.validationMessage(
+                availableCollectionNames: editableCollectionNames
+            ) {
+                feedbackMessage = validationMessage
+                feedbackIsError = true
+                return
+            }
             let nextIndex = (templates.map(\.orderIndex).max() ?? 0) + 1
             let template = imported.toPresetTemplate(orderIndex: nextIndex)
             if templates.contains(where: { $0.name.caseInsensitiveCompare(template.name) == .orderedSame }) {
                 feedbackMessage = "Template '\(template.name)' already exists."
                 feedbackIsError = true
             } else {
-                context.insert(template)
-                try? context.save()
+                transactionContext.insert(template)
+                try transactionContext.save()
                 feedbackMessage = "Imported '\(template.name)' successfully."
                 feedbackIsError = false
             }
         } catch {
-            feedbackMessage = "Invalid template JSON format."
+            transactionContext.rollback()
+            feedbackMessage = "Template import failed: \(error.localizedDescription)"
             feedbackIsError = true
         }
     }
 
     private func deleteTemplate(_ template: PresetTemplate) {
-        context.delete(template)
-        try? context.save()
+        let templateID = template.id
+        let templateName = template.name
+        guard let usageCount = templateUsageCount(template) else {
+            feedbackMessage = "Unlock protected shards and repair unreadable structured shards before deleting a template."
+            feedbackIsError = true
+            return
+        }
+        guard usageCount == 0 else {
+            feedbackMessage = "This template is used by \(usageCount) shard\(usageCount == 1 ? "" : "s") and cannot be deleted."
+            feedbackIsError = true
+            return
+        }
+
+        let transactionContext = ModelContext(context.container)
+        do {
+            let storedTemplates = try transactionContext.fetch(FetchDescriptor<PresetTemplate>())
+            guard let storedTemplate = storedTemplates.first(where: { $0.id == templateID }) else {
+                feedbackMessage = "This template no longer exists."
+                feedbackIsError = true
+                return
+            }
+            transactionContext.delete(storedTemplate)
+            try transactionContext.save()
+            feedbackMessage = "Deleted '\(templateName)'."
+            feedbackIsError = false
+        } catch {
+            transactionContext.rollback()
+            feedbackMessage = "Template deletion failed: \(error.localizedDescription)"
+            feedbackIsError = true
+        }
+    }
+
+    private func templateUsageCount(_ template: PresetTemplate) -> Int? {
+        var count = 0
+        for shard in shards {
+            let rawPayload: String?
+            if shard.encryptionMode == .none {
+                rawPayload = shard.payload
+            } else {
+                rawPayload = try? protection.plaintext(for: shard)
+            }
+            guard let rawPayload else { return nil }
+
+            switch PresetPayload.decoding(rawPayload) {
+            case let .decoded(payload):
+                let matchesID = payload.templateID == template.id
+                let matchesLegacyName = payload.templateID == nil
+                    && payload.presetType.caseInsensitiveCompare(template.name) == .orderedSame
+                if matchesID || matchesLegacyName { count += 1 }
+            case .plainText:
+                continue
+            case .malformedStructured:
+                return nil
+            }
+        }
+        return count
+    }
+
+    private func isBuiltinTemplate(_ template: PresetTemplate) -> Bool {
+        ["Shard", "Password", "Token"].contains(where: {
+            $0.caseInsensitiveCompare(template.name) == .orderedSame
+        })
+    }
+
+    private func saveTemplate(_ draft: TemplateEditorDraft) throws {
+        let transactionContext = ModelContext(context.container)
+        do {
+            let schemaJSON = try draft.encodedSchemaJSON()
+
+            if let templateID = draft.templateID {
+                let storedTemplates = try transactionContext.fetch(FetchDescriptor<PresetTemplate>())
+                guard let template = storedTemplates.first(where: { $0.id == templateID }) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                template.symbol = draft.symbol.trimmingCharacters(in: .whitespacesAndNewlines)
+                template.targetCollectionName = draft.targetCollectionName
+                template.schemaFieldsJSON = schemaJSON
+            } else {
+                let nextIndex = (templates.map(\.orderIndex).max() ?? -1) + 1
+                transactionContext.insert(PresetTemplate(
+                    name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    symbol: draft.symbol.trimmingCharacters(in: .whitespacesAndNewlines),
+                    targetCollectionName: draft.targetCollectionName,
+                    schemaFieldsJSON: schemaJSON,
+                    orderIndex: nextIndex
+                ))
+            }
+
+            try transactionContext.save()
+            feedbackMessage = "Saved '\(draft.name)'."
+            feedbackIsError = false
+        } catch {
+            transactionContext.rollback()
+            feedbackMessage = "Template save failed: \(error.localizedDescription)"
+            feedbackIsError = true
+            throw error
+        }
     }
 
     private func exportJSON() {
@@ -885,6 +1420,15 @@ private struct AdvancedSettingsView: View {
         panel.allowsMultipleSelection = false
         panel.beginSheetModal(for: NSApp.keyWindow ?? NSWindow()) { response in
             guard response == .OK, let url = panel.url else { return }
+            if context.hasChanges {
+                do {
+                    try context.save()
+                } catch {
+                    feedbackMessage = "Save pending edits before importing: \(error.localizedDescription)"
+                    feedbackIsError = true
+                    return
+                }
+            }
             do {
                 let data = try Data(contentsOf: url)
                 let package = try JSONDecoder().decode(ExportPackage.self, from: data)
@@ -1001,10 +1545,11 @@ private struct AdvancedSettingsView: View {
                     imported += 1
                 }
 
-                try? context.save()
+                try context.save()
                 feedbackMessage = "Imported \(imported) shard(s)."
                 feedbackIsError = false
             } catch {
+                context.rollback()
                 feedbackMessage = "Import error: \(error.localizedDescription)"
                 feedbackIsError = true
             }
@@ -1012,13 +1557,58 @@ private struct AdvancedSettingsView: View {
     }
 }
 
-private struct ImportedTemplate: Codable {
-    var name, symbol, targetCollectionName: String
-    var schema: PresetTemplateSchema
+private struct ImportedTemplate {
+    let name: String
+    let symbol: String
+    let targetCollectionName: String
+    let schema: PresetTemplateSchema
+    let schemaJSON: String
+
+    init(data: Data) throws {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let name = root["name"] as? String,
+              let symbol = root["symbol"] as? String,
+              let targetCollectionName = root["targetCollectionName"] as? String,
+              let schemaObject = root["schema"],
+              JSONSerialization.isValidJSONObject(schemaObject) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        let schemaData = try JSONSerialization.data(withJSONObject: schemaObject, options: [.sortedKeys])
+        guard let schemaJSON = String(data: schemaData, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding)
+        }
+
+        self.name = name
+        self.symbol = symbol
+        self.targetCollectionName = targetCollectionName
+        schema = try JSONDecoder().decode(PresetTemplateSchema.self, from: schemaData)
+        self.schemaJSON = schemaJSON
+    }
+
+    func validationMessage(availableCollectionNames: [String]) -> String? {
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Template name cannot be empty."
+        }
+        if !availableCollectionNames.contains(where: {
+            $0.caseInsensitiveCompare(targetCollectionName) == .orderedSame
+        }) {
+            return "Create the category '\(targetCollectionName)' before importing this template."
+        }
+        if schema.fields.isEmpty { return "A template needs at least one field." }
+
+        let keys = schema.fields.map { $0.key.normalizedFieldKey }
+        if keys.contains(where: \.isEmpty) || Set(keys).count != keys.count {
+            return "Template field keys must be non-empty and unique."
+        }
+        let ids = schema.fields.map(\.id)
+        if Set(ids).count != ids.count {
+            return "Template field IDs must be unique."
+        }
+        return nil
+    }
 
     func toPresetTemplate(orderIndex: Int) -> PresetTemplate {
-        let data = (try? JSONEncoder().encode(schema)) ?? Data("{}".utf8)
-        let schemaJSON = String(data: data, encoding: .utf8) ?? "{}"
         return PresetTemplate(name: name, symbol: symbol, targetCollectionName: targetCollectionName,
                               schemaFieldsJSON: schemaJSON, orderIndex: orderIndex)
     }

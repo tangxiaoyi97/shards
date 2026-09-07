@@ -44,6 +44,7 @@ struct AppBackgroundMetrics {
 }
 
 struct AppBackgroundView: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage(AppSettingKeys.backgroundStyle) private var backgroundStyle = "system"
     @AppStorage(AppSettingKeys.backgroundColorHex) private var bgColorHex = "#1A1A2E"
     @AppStorage(AppSettingKeys.backgroundGradientFrom) private var gradientFrom = "#0F0C29"
@@ -61,7 +62,11 @@ struct AppBackgroundView: View {
     }
 
     var body: some View {
-        backgroundLayer
+        if reduceTransparency, backgroundStyle == "glass" || backgroundStyle == "tinted_glass" {
+            Color(nsColor: .windowBackgroundColor)
+        } else {
+            backgroundLayer
+        }
     }
 
     @ViewBuilder

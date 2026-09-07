@@ -1,4 +1,5 @@
 import AppKit
+import CoreSpotlight
 import KeyboardShortcuts
 import SwiftData
 import SwiftUI
@@ -47,6 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupQuickEntryPanel()
         setupShortcuts()
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            SpotlightIndexingService.shared.start(
+                container: VaultContainer.shared.container,
+                persistentStoreAvailable: VaultContainer.shared.isPersistentStoreAvailable
+            )
+        }
 
         // Defer activation-policy application so SwiftUI has already
         // presented the window; calling it synchronously here can race
@@ -96,6 +103,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func application(
+        _ application: NSApplication,
+        continue userActivity: NSUserActivity,
+        restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
+    ) -> Bool {
+        guard userActivity.activityType == CSSearchableItemActionType,
+              let itemIdentifier = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String,
+              let shardID = SpotlightItemIdentifier.shardID(from: itemIdentifier)
+        else { return false }
+
+        guard SpotlightIndexingService.shared.isEnabled,
+              let shard = try? VaultRepository.shared.shard(withID: shardID),
+              shard.deletedAt == nil,
+              shard.encryptionMode == .none,
+              isSpotlightVisible(shard)
+        else {
+            SpotlightIndexingService.shared.scheduleRebuild(immediately: true)
+            showToast(message: "This shard is no longer available in Spotlight")
+            return true
+        }
+
+        openVaultUI()
+        SpotlightOpenRequestStore.shared.requestOpen(shardID: shardID)
+        return true
+    }
+
     // Hide from Dock (but keep in menu bar) or show in both
     private func applyDockIconPreference() {
         let hide = defaults.bool(forKey: "hide_dock_icon")
@@ -116,6 +149,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func isSpotlightVisible(_ shard: Shard) -> Bool {
+        let context = VaultContainer.shared.container.mainContext
+        guard let tags = try? context.fetch(FetchDescriptor<Tag>()) else { return false }
+        let privateTagIDs = Set(tags.compactMap { tag in
+            let isPrivate = tag.name.caseInsensitiveCompare("Hidden") == .orderedSame
+                || tag.name.caseInsensitiveCompare("Locked") == .orderedSame
+            return isPrivate ? tag.id : nil
+        })
+        return privateTagIDs.isDisjoint(with: shard.tagIds)
+    }
+
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         true
     }
@@ -126,6 +170,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ sender: NSApplication, shouldRestoreApplicationState coder: NSCoder) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let vault = VaultContainer.shared
+        let flushRequest = VaultFlushRequest()
+        if vault.isPersistentStoreAvailable,
+           !SettingsPendingEditCoordinator.flush(using: vault.container.mainContext) {
+            flushRequest.recordFailure("Tag changes could not be saved.")
+        }
+        NotificationCenter.default.post(name: .vaultFlushRequested, object: flushRequest)
+        if !flushRequest.failureMessages.isEmpty {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Shards could not save your latest changes"
+            alert.informativeText = flushRequest.failureMessages.joined(separator: "\n")
+            alert.addButton(withTitle: "Keep Shards Open")
+            alert.runModal()
+            return .terminateCancel
+        }
+
+        guard vault.isPersistentStoreAvailable else {
+            return .terminateNow
+        }
+
+        let context = vault.container.mainContext
+        guard context.hasChanges else {
+            return .terminateNow
+        }
+
+        do {
+            try context.save()
+            return .terminateNow
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Shards could not save your latest changes"
+            alert.informativeText = "Quit was cancelled so you can retry or copy your edits. \(error.localizedDescription)"
+            alert.addButton(withTitle: "Keep Shards Open")
+            alert.runModal()
+            return .terminateCancel
+        }
     }
 
     private func setupMenuBar() {
@@ -250,8 +335,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             let context = VaultContainer.shared.container.mainContext
-            let tags = (try? context.fetch(FetchDescriptor<Tag>())) ?? []
-            let collections = (try? context.fetch(FetchDescriptor<ShardCollection>())) ?? []
+            let tags = try context.fetch(FetchDescriptor<Tag>())
+            let collections = try context.fetch(FetchDescriptor<ShardCollection>())
             let shardsCollectionId = collections.first(where: {
                 $0.name == VaultContainer.Defaults.shardsCollectionName
             })?.id ?? VaultContainer.Defaults.allCollectionID
@@ -267,6 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             flashStatusBarIcon(success: true)
         } catch {
             flashStatusBarIcon(success: false)
+            showToast(message: error.localizedDescription)
         }
     }
 

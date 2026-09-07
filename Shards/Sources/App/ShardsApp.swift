@@ -1,4 +1,114 @@
+import Observation
 import SwiftUI
+
+enum VaultCommand {
+    case createShard
+    case save
+    case togglePin
+    case moveToTrash
+    case focusSearch
+    case toggleEditorFocus
+}
+
+struct VaultCommandState: Equatable {
+    let canSave: Bool
+    let canTogglePin: Bool
+    let canMoveToTrash: Bool
+    let isEditorFocused: Bool
+
+    static let unavailable = VaultCommandState(
+        canSave: false,
+        canTogglePin: false,
+        canMoveToTrash: false,
+        isEditorFocused: false
+    )
+}
+
+struct VaultCommandRequest {
+    let targetID: UUID
+    let command: VaultCommand
+}
+
+extension Notification.Name {
+    static let vaultCommandRequested = Notification.Name("vaultCommandRequested")
+}
+
+@MainActor
+@Observable
+final class VaultCommandDispatcher {
+    let targetID = UUID()
+    private(set) var state = VaultCommandState.unavailable
+
+    func update(_ state: VaultCommandState) {
+        self.state = state
+    }
+
+    func perform(_ command: VaultCommand) {
+        NotificationCenter.default.post(
+            name: .vaultCommandRequested,
+            object: VaultCommandRequest(targetID: targetID, command: command)
+        )
+    }
+}
+
+private struct VaultCommandDispatcherKey: FocusedValueKey {
+    typealias Value = VaultCommandDispatcher
+}
+
+extension FocusedValues {
+    var vaultCommandDispatcher: VaultCommandDispatcher? {
+        get { self[VaultCommandDispatcherKey.self] }
+        set { self[VaultCommandDispatcherKey.self] = newValue }
+    }
+}
+
+private struct VaultCommands: Commands {
+    @FocusedValue(\.vaultCommandDispatcher) private var dispatcher
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Shard") {
+                dispatcher?.perform(.createShard)
+            }
+            .keyboardShortcut("n", modifiers: .command)
+            .disabled(dispatcher == nil)
+        }
+
+        CommandMenu("Shard") {
+            Button("Save Shard") {
+                dispatcher?.perform(.save)
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(dispatcher?.state.canSave != true)
+
+            Button("Toggle Pin") {
+                dispatcher?.perform(.togglePin)
+            }
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+            .disabled(dispatcher?.state.canTogglePin != true)
+
+            Divider()
+
+            Button("Focus Search") {
+                dispatcher?.perform(.focusSearch)
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(dispatcher == nil)
+
+            Button(dispatcher?.state.isEditorFocused == true ? "Exit Focus Mode" : "Focus Editor") {
+                dispatcher?.perform(.toggleEditorFocus)
+            }
+            .disabled(dispatcher?.state.canSave != true)
+
+            Divider()
+
+            Button("Move to Trash", role: .destructive) {
+                dispatcher?.perform(.moveToTrash)
+            }
+            .disabled(dispatcher?.state.canMoveToTrash != true)
+        }
+    }
+}
 
 @main
 struct ShardsApp: App {
@@ -33,6 +143,8 @@ struct ShardsApp: App {
         .defaultSize(width: 1120, height: 720)
         .restorationBehavior(.disabled)
         .commands {
+            VaultCommands()
+
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     UpdateController.shared.checkForUpdates()

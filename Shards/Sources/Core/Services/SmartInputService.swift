@@ -183,7 +183,8 @@ actor SmartInputService {
             payload: PresetPayload(
                 presetType: matchedTemplate.name,
                 fields: mappedFields,
-                preferredStyle: matchedTemplate.schema.presentationStyle.rawValue
+                preferredStyle: matchedTemplate.schema.presentationStyle.rawValue,
+                templateID: matchedTemplate.templateID
             )
         )
     }

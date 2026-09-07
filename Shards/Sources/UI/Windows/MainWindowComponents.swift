@@ -2,6 +2,47 @@ import AppKit
 import Observation
 import SwiftUI
 
+extension Notification.Name {
+    static let vaultFlushRequested = Notification.Name("vaultFlushRequested")
+}
+
+@MainActor
+final class VaultFlushRequest {
+    private(set) var failureMessages: [String] = []
+
+    func recordFailure(_ message: String) {
+        if !failureMessages.contains(message) {
+            failureMessages.append(message)
+        }
+    }
+}
+
+@MainActor
+enum ShardDetailBindingAccess {
+    static func binding<Value>(
+        shardID: String,
+        fallback: Value,
+        isActive: @escaping () -> Bool,
+        resolve: @escaping (String) -> Shard?,
+        read: @escaping (Shard) -> Value,
+        write: @escaping (Shard, Value) -> Void
+    ) -> Binding<Value> {
+        Binding(
+            get: {
+                // SwiftUI and AppKit editors may briefly keep an old Binding
+                // alive while a detail view is being removed. Check value state
+                // before resolving, so a deleted SwiftData model is never read.
+                guard isActive(), let shard = resolve(shardID) else { return fallback }
+                return read(shard)
+            },
+            set: { value in
+                guard isActive(), let shard = resolve(shardID) else { return }
+                write(shard, value)
+            }
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class ModifierKeyMonitor {
@@ -22,6 +63,38 @@ final class ModifierKeyMonitor {
     }
 }
 
+@MainActor
+@Observable
+final class DebouncedSaveScheduler {
+    @ObservationIgnored private var task: Task<Void, Never>?
+
+    func schedule(after delay: Duration, action: @escaping @MainActor () -> Void) {
+        task?.cancel()
+        task = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.task = nil
+            action()
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+}
+
+struct ShardTagSummary: Identifiable {
+    let id: String
+    let name: String
+    let symbol: String
+    let colorHex: String
+}
+
 struct ShardListRow: View {
     let title: String
     let modeName: String
@@ -30,7 +103,7 @@ struct ShardListRow: View {
     let isDeleted: Bool
     let isLocked: Bool
     let isProtected: Bool
-    let tags: [(name: String, symbol: String, colorHex: String)]
+    let tags: [ShardTagSummary]
     let dateString: String
     var isCompact = false
     var accentColor: Color = .accentColor
@@ -52,7 +125,7 @@ struct ShardListRow: View {
 
                 if isCompact && !tags.isEmpty {
                     HStack(spacing: 3) {
-                        ForEach(tags.prefix(3), id: \.name) { tag in
+                        ForEach(tags.prefix(3)) { tag in
                             Image(systemName: tag.symbol)
                                 .font(.system(size: 9, weight: .semibold))
                                 .foregroundStyle(Color(hex: tag.colorHex) ?? .secondary)
@@ -122,14 +195,14 @@ struct ShardListRow: View {
     private var adaptiveTagSummary: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
-                ForEach(tags.prefix(3), id: \.name) { tag in
+                ForEach(tags.prefix(3)) { tag in
                     tagSummaryChip(for: tag, showsLabel: true)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 6) {
-                ForEach(tags.prefix(3), id: \.name) { tag in
+                ForEach(tags.prefix(3)) { tag in
                     tagSummaryChip(for: tag, showsLabel: false)
                 }
             }
@@ -138,7 +211,7 @@ struct ShardListRow: View {
     }
 
     private func tagSummaryChip(
-        for tag: (name: String, symbol: String, colorHex: String),
+        for tag: ShardTagSummary,
         showsLabel: Bool
     ) -> some View {
         HStack(spacing: 2) {
@@ -151,6 +224,99 @@ struct ShardListRow: View {
             }
         }
         .foregroundStyle(Color(hex: tag.colorHex) ?? .secondary)
+    }
+}
+
+struct DetailTagSection<PopoverContent: View>: View {
+    let attachedTags: [Tag]
+    let canEdit: Bool
+    let accentColor: Color
+    let onSelect: (Tag) -> Void
+    let onRemove: (Tag) -> Void
+    let popoverContent: () -> PopoverContent
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isPopoverPresented = false
+
+    init(
+        attachedTags: [Tag],
+        canEdit: Bool,
+        accentColor: Color,
+        onSelect: @escaping (Tag) -> Void,
+        onRemove: @escaping (Tag) -> Void,
+        @ViewBuilder popoverContent: @escaping () -> PopoverContent
+    ) {
+        self.attachedTags = attachedTags
+        self.canEdit = canEdit
+        self.accentColor = accentColor
+        self.onSelect = onSelect
+        self.onRemove = onRemove
+        self.popoverContent = popoverContent
+    }
+
+    private var attachedTagIDs: [String] {
+        attachedTags.map(\.id)
+    }
+
+    var body: some View {
+        FlowLayout(spacing: 6) {
+            ForEach(attachedTags) { tag in
+                tagChip(tag)
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .scale(scale: 0.96, anchor: .leading).combined(with: .opacity)
+                    )
+            }
+
+            if canEdit {
+                Button {
+                    isPopoverPresented = true
+                } label: {
+                    Label("Add Tag", systemImage: "plus")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(.quaternary.opacity(0.55), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $isPopoverPresented, arrowEdge: .top) {
+                    popoverContent()
+                }
+                .accessibilityLabel("Add tag")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: attachedTagIDs)
+        .onChange(of: canEdit) { _, canEdit in
+            if !canEdit {
+                isPopoverPresented = false
+            }
+        }
+    }
+
+    private func tagChip(_ tag: Tag) -> some View {
+        let color = Color(hex: tag.colorHex) ?? accentColor
+        return Button { onSelect(tag) } label: {
+            HStack(spacing: 4) {
+                Image(systemName: tag.symbol)
+                    .font(.caption2.weight(.semibold))
+                Text(tag.name)
+                    .font(.caption.weight(.medium))
+            }
+            .foregroundStyle(color)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(color.opacity(0.12), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(role: .destructive) { onRemove(tag) } label: {
+                Label("Remove Tag", systemImage: "tag.slash")
+            }
+            .disabled(!canEdit)
+        }
     }
 }
 
@@ -292,7 +458,7 @@ extension View {
 }
 
 struct TagPopoverContent: View {
-    let shard: Shard
+    let attachedTagIDs: Set<String>
     let availableTags: [Tag]
     var accentColor = Color(red: 79 / 255, green: 70 / 255, blue: 229 / 255)
     let onToggleTag: (Tag) -> Void
@@ -322,7 +488,7 @@ struct TagPopoverContent: View {
                                     .font(.body)
                                     .foregroundStyle(.primary)
                                 Spacer()
-                                if shard.tagIds.contains(tag.id) {
+                                if attachedTagIDs.contains(tag.id) {
                                     Image(systemName: "checkmark")
                                         .font(.caption.weight(.bold))
                                         .foregroundStyle(Color(hex: tag.colorHex) ?? accentColor)
@@ -331,7 +497,7 @@ struct TagPopoverContent: View {
                             .padding(.vertical, 6)
                             .padding(.horizontal, 8)
                             .background(
-                                shard.tagIds.contains(tag.id)
+                                attachedTagIDs.contains(tag.id)
                                     ? (Color(hex: tag.colorHex) ?? accentColor).opacity(0.08)
                                     : .clear,
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -554,5 +720,40 @@ struct ProtectionPasswordSheet: View {
         }
         .padding(20)
         .frame(width: 360)
+    }
+}
+
+struct VaultUnavailableOverlay: View {
+    let detail: String
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+                .opacity(0.96)
+                .ignoresSafeArea()
+
+            VStack(spacing: 14) {
+                Image(systemName: "externaldrive.badge.exclamationmark")
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundStyle(.orange)
+
+                Text("Vault unavailable")
+                    .font(.title2.weight(.semibold))
+
+                Text(detail)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+
+                Button("Reveal Vault Folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([VaultContainer.vaultDirectory])
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(32)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Vault unavailable. Editing is disabled.")
     }
 }

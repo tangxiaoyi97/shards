@@ -11,6 +11,8 @@ enum ProtectionError: LocalizedError {
     case shardNotProtected
     case shardAlreadyProtected
     case shardLocked
+    case configurationPersistenceFailed
+    case inconsistentGlobalProtectionState
 
     var errorDescription: String? {
         switch self {
@@ -28,7 +30,105 @@ enum ProtectionError: LocalizedError {
             return "This shard is already protected."
         case .shardLocked:
             return "Unlock this protected shard before editing it."
+        case .configurationPersistenceFailed:
+            return "The protection configuration could not be saved. The vault was not changed."
+        case .inconsistentGlobalProtectionState:
+            return "The protected vault state is inconsistent. Editing is disabled to avoid encrypting content with the wrong password."
         }
+    }
+}
+
+struct GlobalProtectionConfiguration: Codable, Equatable {
+    enum State: String, Codable {
+        case pendingEnable
+        case pendingDisable
+        case enabled
+    }
+
+    let version: Int
+    let state: State
+    let salt: String
+    let verifier: String
+    let preGlobalCount: Int
+    let expectedPostGlobalCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case state
+        case salt
+        case verifier
+        case preGlobalCount
+        case expectedPostGlobalCount
+        case expectedConvertedCount
+    }
+
+    init(
+        version: Int,
+        state: State,
+        salt: String,
+        verifier: String,
+        preGlobalCount: Int,
+        expectedPostGlobalCount: Int
+    ) {
+        self.version = version
+        self.state = state
+        self.salt = salt
+        self.verifier = verifier
+        self.preGlobalCount = preGlobalCount
+        self.expectedPostGlobalCount = expectedPostGlobalCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        state = try container.decode(State.self, forKey: .state)
+        salt = try container.decode(String.self, forKey: .salt)
+        verifier = try container.decode(String.self, forKey: .verifier)
+
+        switch version {
+        case 2:
+            // Compatibility with the short-lived v2 record. Enabling was only
+            // safe from a vault without existing global rows, so its converted
+            // count is the expected post-transaction total.
+            self.preGlobalCount = 0
+            self.expectedPostGlobalCount = try container.decode(
+                Int.self,
+                forKey: .expectedConvertedCount
+            )
+        case 3:
+            self.preGlobalCount = try container.decode(Int.self, forKey: .preGlobalCount)
+            self.expectedPostGlobalCount = try container.decode(
+                Int.self,
+                forKey: .expectedPostGlobalCount
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .version,
+                in: container,
+                debugDescription: "Unsupported global protection configuration version."
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(state, forKey: .state)
+        try container.encode(salt, forKey: .salt)
+        try container.encode(verifier, forKey: .verifier)
+        try container.encode(preGlobalCount, forKey: .preGlobalCount)
+        try container.encode(expectedPostGlobalCount, forKey: .expectedPostGlobalCount)
+    }
+
+    func promotedToEnabled() -> Self {
+        Self(
+            version: 3,
+            state: .enabled,
+            salt: salt,
+            verifier: verifier,
+            preGlobalCount: 0,
+            expectedPostGlobalCount: 0
+        )
     }
 }
 
@@ -100,11 +200,12 @@ final class ProtectionService: ObservableObject {
     @Published private(set) var globalProtectionEnabled = false
     @Published private(set) var globalUnlocked = true
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private var globalSessionPassword: String?
     private var shardSessionPasswords: [String: String] = [:]
 
-    private init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         refreshConfiguration()
     }
 
@@ -113,13 +214,99 @@ final class ProtectionService: ObservableObject {
     }
 
     func refreshConfiguration() {
-        globalProtectionEnabled = defaults.bool(forKey: AppSettingKeys.globalProtectionEnabled)
+        globalProtectionEnabled = protectionConfiguration()?.state == .enabled
         if !globalProtectionEnabled {
             globalUnlocked = true
             globalSessionPassword = nil
         } else {
             globalUnlocked = globalSessionPassword != nil
         }
+    }
+
+    /// Resolves process-interruption windows in global protection by comparing
+    /// a durable pending configuration with the SwiftData transaction result.
+    /// Exact before/after row counts distinguish a committed conversion from
+    /// an interrupted one. Any mixed state is preserved and rejected rather
+    /// than guessing which password encrypted which rows.
+    func recoverPendingConfiguration(context: ModelContext) throws {
+        guard let configuration = storedConfiguration() else {
+            let hasUnreadableConfiguration = defaults.object(
+                forKey: AppSettingKeys.globalProtectionConfiguration
+            ) != nil
+            guard !hasUnreadableConfiguration,
+                  try globalShardCount(in: context) == 0
+            else {
+                throw ProtectionError.inconsistentGlobalProtectionState
+            }
+            refreshConfiguration()
+            return
+        }
+        guard configuration.state != .enabled else {
+            refreshConfiguration()
+            return
+        }
+
+        let globalCount = try globalShardCount(in: context)
+
+        switch configuration.state {
+        case .pendingEnable:
+            guard configuration.preGlobalCount >= 0,
+                  configuration.expectedPostGlobalCount >= configuration.preGlobalCount
+            else {
+                throw ProtectionError.inconsistentGlobalProtectionState
+            }
+
+            if configuration.expectedPostGlobalCount == configuration.preGlobalCount {
+                // A zero-row conversion cannot be distinguished from an intent
+                // written immediately before a crash. Disabling is the safer and
+                // fully recoverable outcome because no payload changed.
+                guard globalCount == configuration.preGlobalCount else {
+                    throw ProtectionError.inconsistentGlobalProtectionState
+                }
+                guard clearConfiguration() else {
+                    throw ProtectionError.configurationPersistenceFailed
+                }
+            } else if globalCount == configuration.expectedPostGlobalCount {
+                guard persistConfiguration(configuration.promotedToEnabled(), mirrorLegacy: true) else {
+                    throw ProtectionError.configurationPersistenceFailed
+                }
+            } else if globalCount == configuration.preGlobalCount {
+                guard clearConfiguration() else {
+                    throw ProtectionError.configurationPersistenceFailed
+                }
+            } else {
+                throw ProtectionError.inconsistentGlobalProtectionState
+            }
+
+        case .pendingDisable:
+            guard configuration.preGlobalCount >= 0,
+                  configuration.expectedPostGlobalCount == 0
+            else {
+                throw ProtectionError.inconsistentGlobalProtectionState
+            }
+
+            if globalCount == configuration.expectedPostGlobalCount {
+                // The plaintext transaction committed. Finish disabling while
+                // keeping the pending record durable until legacy mirrors are gone.
+                guard clearConfiguration() else {
+                    throw ProtectionError.configurationPersistenceFailed
+                }
+            } else if globalCount == configuration.preGlobalCount {
+                // The transaction never committed. Restore the enabled record;
+                // all global rows still use the verifier's password.
+                guard persistConfiguration(configuration.promotedToEnabled(), mirrorLegacy: true) else {
+                    throw ProtectionError.configurationPersistenceFailed
+                }
+            } else {
+                // Some, but not all, rows changed. Do not guess or discard the
+                // verifier because doing so could expose or strand payloads.
+                throw ProtectionError.inconsistentGlobalProtectionState
+            }
+
+        case .enabled:
+            break
+        }
+        refreshConfiguration()
     }
 
     func desiredEncryptionModeForNewShard() -> EncryptionMode {
@@ -152,6 +339,12 @@ final class ProtectionService: ObservableObject {
         shardSessionPasswords.removeValue(forKey: shard.id)
     }
 
+    func forgetShardSessions(withIDs shardIDs: some Sequence<String>) {
+        for shardID in shardIDs {
+            shardSessionPasswords.removeValue(forKey: shardID)
+        }
+    }
+
     func unlockGlobal(password: String) throws {
         guard globalProtectionEnabled else {
             throw ProtectionError.globalProtectionDisabled
@@ -169,47 +362,124 @@ final class ProtectionService: ObservableObject {
             throw ProtectionError.emptyPassword
         }
 
+        let shards = try context.fetch(FetchDescriptor<Shard>())
+        let preGlobalCount = shards.lazy.filter { $0.encryptionMode == .global }.count
+        let existingConfiguration = storedConfiguration()
+        let hasConfigurationRecord = defaults.object(
+            forKey: AppSettingKeys.globalProtectionConfiguration
+        ) != nil
+        guard !globalProtectionEnabled,
+              existingConfiguration == nil,
+              !hasConfigurationRecord,
+              preGlobalCount == 0
+        else {
+            throw ProtectionError.inconsistentGlobalProtectionState
+        }
+
         let salt = Data((0..<16).map { _ in UInt8.random(in: .min ... .max) })
-        defaults.set(true, forKey: AppSettingKeys.globalProtectionEnabled)
-        defaults.set(salt.base64EncodedString(), forKey: AppSettingKeys.globalProtectionSalt)
-        defaults.set(
-            PasswordCipher.makeVerifier(password: normalized, salt: salt),
-            forKey: AppSettingKeys.globalProtectionVerifier
+        let verifier = PasswordCipher.makeVerifier(password: normalized, salt: salt)
+        let convertibleShards = shards.filter { $0.encryptionMode == .none }
+        let pendingConfiguration = GlobalProtectionConfiguration(
+            version: 3,
+            state: .pendingEnable,
+            salt: salt.base64EncodedString(),
+            verifier: verifier,
+            preGlobalCount: preGlobalCount,
+            expectedPostGlobalCount: preGlobalCount + convertibleShards.count
         )
+        guard persistConfiguration(pendingConfiguration, mirrorLegacy: false) else {
+            clearConfiguration()
+            throw ProtectionError.configurationPersistenceFailed
+        }
+
+        do {
+            let timestamp = Date()
+            for shard in convertibleShards {
+                shard.payload = try PasswordCipher.encrypt(
+                    shard.payload,
+                    password: normalized,
+                    prefix: PasswordCipher.globalPrefix
+                )
+                shard.encryptionMode = .global
+                shard.updatedAt = timestamp
+            }
+            try context.save()
+        } catch {
+            context.rollback()
+            clearConfiguration()
+            throw error
+        }
+
+        let enabledConfiguration = GlobalProtectionConfiguration(
+            version: 3,
+            state: .enabled,
+            salt: salt.base64EncodedString(),
+            verifier: verifier,
+            preGlobalCount: 0,
+            expectedPostGlobalCount: 0
+        )
+        // The durable pending record was written before the database commit.
+        // If this final promotion cannot be flushed immediately, the current
+        // session remains usable and startup recovery will promote it later.
+        _ = persistConfiguration(enabledConfiguration, mirrorLegacy: true)
         globalSessionPassword = normalized
         globalProtectionEnabled = true
         globalUnlocked = true
-
-        let shards = (try? context.fetch(FetchDescriptor<Shard>())) ?? []
-        for shard in shards where shard.encryptionMode == .none {
-            shard.payload = try PasswordCipher.encrypt(shard.payload, password: normalized, prefix: PasswordCipher.globalPrefix)
-            shard.encryptionMode = .global
-            shard.updatedAt = Date()
-        }
-        try context.save()
     }
 
     func disableGlobalProtection(password: String, context: ModelContext) throws {
         let normalized = normalizedPassword(password)
-        guard verifyGlobalPassword(normalized) else {
+        guard let enabledConfiguration = protectionConfiguration(),
+              verifyGlobalPassword(normalized)
+        else {
             throw ProtectionError.invalidPassword
         }
 
-        let shards = (try? context.fetch(FetchDescriptor<Shard>())) ?? []
-        for shard in shards where shard.encryptionMode == .global {
-            shard.payload = try PasswordCipher.decrypt(shard.payload, password: normalized, expectedPrefix: PasswordCipher.globalPrefix)
-            shard.encryptionMode = .none
-            shard.updatedAt = Date()
+        let shards = try context.fetch(FetchDescriptor<Shard>())
+        let preGlobalCount = shards.lazy.filter { $0.encryptionMode == .global }.count
+        let pendingConfiguration = GlobalProtectionConfiguration(
+            version: 3,
+            state: .pendingDisable,
+            salt: enabledConfiguration.salt,
+            verifier: enabledConfiguration.verifier,
+            preGlobalCount: preGlobalCount,
+            expectedPostGlobalCount: 0
+        )
+        guard persistConfiguration(pendingConfiguration, mirrorLegacy: true) else {
+            _ = persistConfiguration(enabledConfiguration, mirrorLegacy: true)
+            throw ProtectionError.configurationPersistenceFailed
         }
-        try context.save()
 
-        defaults.removeObject(forKey: AppSettingKeys.globalProtectionEnabled)
-        defaults.removeObject(forKey: AppSettingKeys.globalProtectionSalt)
-        defaults.removeObject(forKey: AppSettingKeys.globalProtectionVerifier)
+        do {
+            let timestamp = Date()
+            for shard in shards where shard.encryptionMode == .global {
+                shard.payload = try PasswordCipher.decrypt(
+                    shard.payload,
+                    password: normalized,
+                    expectedPrefix: PasswordCipher.globalPrefix
+                )
+                shard.encryptionMode = .none
+                shard.updatedAt = timestamp
+            }
+            try context.save()
+        } catch {
+            context.rollback()
+            guard persistConfiguration(enabledConfiguration, mirrorLegacy: true) else {
+                throw ProtectionError.configurationPersistenceFailed
+            }
+            throw error
+        }
 
         globalSessionPassword = nil
         globalProtectionEnabled = false
         globalUnlocked = true
+
+        // Clear the compatibility mirrors first and the pending record last.
+        // If the process stops after SwiftData commits, startup recovery sees
+        // pendingDisable and safely finishes this step.
+        guard clearConfiguration() else {
+            throw ProtectionError.configurationPersistenceFailed
+        }
     }
 
     func plaintext(for shard: Shard) throws -> String {
@@ -328,12 +598,83 @@ final class ProtectionService: ObservableObject {
     }
 
     private func verifyGlobalPassword(_ password: String) -> Bool {
-        guard let saltString = defaults.string(forKey: AppSettingKeys.globalProtectionSalt),
-              let verifier = defaults.string(forKey: AppSettingKeys.globalProtectionVerifier),
-              let salt = Data(base64Encoded: saltString)
+        guard let configuration = protectionConfiguration(),
+              let salt = Data(base64Encoded: configuration.salt)
         else { return false }
 
-        return PasswordCipher.makeVerifier(password: normalizedPassword(password), salt: salt) == verifier
+        return PasswordCipher.makeVerifier(password: normalizedPassword(password), salt: salt)
+            == configuration.verifier
+    }
+
+    private func protectionConfiguration() -> GlobalProtectionConfiguration? {
+        let configuration = storedConfiguration()
+        return configuration?.state == .enabled ? configuration : nil
+    }
+
+    private func storedConfiguration() -> GlobalProtectionConfiguration? {
+        if let data = defaults.data(forKey: AppSettingKeys.globalProtectionConfiguration),
+           let configuration = try? JSONDecoder().decode(GlobalProtectionConfiguration.self, from: data) {
+            return configuration
+        }
+
+        // One-time compatibility read for existing v1 installations. The new
+        // single-record format becomes authoritative as soon as it is written.
+        guard defaults.bool(forKey: AppSettingKeys.globalProtectionEnabled),
+              let salt = defaults.string(forKey: AppSettingKeys.globalProtectionSalt),
+              Data(base64Encoded: salt) != nil,
+              let verifier = defaults.string(forKey: AppSettingKeys.globalProtectionVerifier)
+        else { return nil }
+
+        let migrated = GlobalProtectionConfiguration(
+            version: 3,
+            state: .enabled,
+            salt: salt,
+            verifier: verifier,
+            preGlobalCount: 0,
+            expectedPostGlobalCount: 0
+        )
+        _ = persistConfiguration(migrated, mirrorLegacy: true)
+        return migrated
+    }
+
+    @discardableResult
+    private func persistConfiguration(
+        _ configuration: GlobalProtectionConfiguration,
+        mirrorLegacy: Bool
+    ) -> Bool {
+        guard let data = try? JSONEncoder().encode(configuration) else { return false }
+        defaults.set(data, forKey: AppSettingKeys.globalProtectionConfiguration)
+        guard defaults.synchronize() else { return false }
+
+        if mirrorLegacy {
+            // These keys remain as a compatibility mirror only. `enabled` is
+            // deliberately last; the atomic v2 record above is authoritative.
+            defaults.set(configuration.salt, forKey: AppSettingKeys.globalProtectionSalt)
+            defaults.set(configuration.verifier, forKey: AppSettingKeys.globalProtectionVerifier)
+            defaults.set(true, forKey: AppSettingKeys.globalProtectionEnabled)
+        }
+        return true
+    }
+
+    @discardableResult
+    private func clearConfiguration() -> Bool {
+        // Keep the atomic pending record until the legacy enabled mirror has
+        // durably disappeared. Otherwise a crash between removals could make
+        // plaintext rows look protected again through the compatibility path.
+        defaults.removeObject(forKey: AppSettingKeys.globalProtectionEnabled)
+        defaults.removeObject(forKey: AppSettingKeys.globalProtectionSalt)
+        defaults.removeObject(forKey: AppSettingKeys.globalProtectionVerifier)
+        guard defaults.synchronize() else { return false }
+
+        defaults.removeObject(forKey: AppSettingKeys.globalProtectionConfiguration)
+        return defaults.synchronize()
+    }
+
+    private func globalShardCount(in context: ModelContext) throws -> Int {
+        try context.fetch(FetchDescriptor<Shard>())
+            .lazy
+            .filter { $0.encryptionMode == .global }
+            .count
     }
 
     private func normalizedPassword(_ password: String) -> String {

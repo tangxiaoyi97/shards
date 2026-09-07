@@ -217,6 +217,7 @@ final class QuickEntryPanelTransitionController {
         panel.orderOut(nil)
         panel.alphaValue = 1
         dismissalTask = nil
+        NotificationCenter.default.post(name: .quickEntryDidDismiss, object: nil)
     }
 
     private func cancelDismissalTask() {

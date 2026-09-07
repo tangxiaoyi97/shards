@@ -24,6 +24,45 @@ enum QuickEntryModeCycle {
     }
 }
 
+enum QuickEntrySubmissionOutcome: Equatable {
+    case blocked(requiredFieldName: String)
+    case advance(nextIndex: Int, skippedOptionalField: Bool)
+    case save(skippedOptionalField: Bool)
+}
+
+enum QuickEntryFormPolicy {
+    static func submissionOutcome(
+        field: PresetField?,
+        input: String,
+        currentIndex: Int,
+        fieldCount: Int
+    ) -> QuickEntrySubmissionOutcome {
+        guard let field else {
+            return .blocked(requiredFieldName: "Content")
+        }
+
+        let isEmpty = input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if field.isRequired && isEmpty {
+            return .blocked(requiredFieldName: field.name)
+        }
+
+        let skippedOptionalField = !field.isRequired && isEmpty
+        if currentIndex < fieldCount - 1 {
+            return .advance(
+                nextIndex: currentIndex + 1,
+                skippedOptionalField: skippedOptionalField
+            )
+        }
+        return .save(skippedOptionalField: skippedOptionalField)
+    }
+}
+
+enum QuickEntryModeTransferPolicy {
+    static func seedText(from input: String, sourceField: PresetField?) -> String? {
+        sourceField?.isEffectivelySensitive == true ? nil : input
+    }
+}
+
 private enum QuickEntryLayout {
     static let rawSelectionToken = "__raw__"
 }
@@ -36,8 +75,24 @@ private struct SmartPreviewState: Identifiable {
     var fields: [PresetField]
 }
 
+private struct QuickEntryModeDraft {
+    var fields: [PresetField]
+    var currentFieldIndex: Int
+}
+
+private enum QuickEntryFeedback: Equatable {
+    case none
+    case error(String)
+
+    var errorMessage: String? {
+        guard case let .error(message) = self else { return nil }
+        return message
+    }
+}
+
 extension Notification.Name {
     static let quickEntryWillOpen = Notification.Name("quickEntryWillOpen")
+    static let quickEntryDidDismiss = Notification.Name("quickEntryDidDismiss")
 }
 
 struct QuickEntryActions {
@@ -65,10 +120,13 @@ struct QuickEntryContentView: View {
     @State private var currentFieldIndex = 0
     @State private var payloadBuffer: [PresetField] = []
     @State private var inputText = ""
-    @State private var statusText = "Ready"
+    @State private var feedback: QuickEntryFeedback = .none
+    @State private var modeDrafts: [QuickEntryMode: QuickEntryModeDraft] = [:]
     @State private var isProcessing = false
     @State private var isCompletingCapture = false
     @State private var smartPreview: SmartPreviewState?
+    @State private var smartRequestTask: Task<Void, Never>?
+    @State private var smartRequestGeneration = 0
     @FocusState private var isInputFocused: Bool
 
     init(
@@ -139,11 +197,22 @@ struct QuickEntryContentView: View {
     }
 
     private var isShowingFailureFeedback: Bool {
-        statusText.lowercased().contains("fail")
+        feedback.errorMessage != nil
     }
 
     private var isShowingSmartPreview: Bool {
         smartPreview != nil
+    }
+
+    private var hasUnsavedUserDraft: Bool {
+        guard !isCompletingCapture else { return false }
+        return !inputText.isEmpty
+            || payloadBuffer.contains(where: { !$0.value.isEmpty })
+            || modeDrafts.values.contains(where: { draft in
+                draft.fields.contains(where: { !$0.value.isEmpty })
+            })
+            || smartPreview != nil
+            || isProcessing
     }
 
     private var previewTemplateSelection: Binding<String> {
@@ -206,7 +275,10 @@ struct QuickEntryContentView: View {
 
     var body: some View {
         Group {
-            if isShowingSmartPreview {
+            if !VaultContainer.shared.isPersistentStoreAvailable {
+                vaultUnavailableView
+                    .padding(.horizontal, 18)
+            } else if isShowingSmartPreview {
                 smartPreviewView
                     .padding(24)
             } else {
@@ -230,7 +302,7 @@ struct QuickEntryContentView: View {
         .allowsHitTesting(presentationState.isContentVisible)
         .accessibilityHidden(!presentationState.isContentVisible)
         .animation(interfaceAnimation, value: isProcessing)
-        .animation(interfaceAnimation, value: isShowingFailureFeedback)
+        .animation(interfaceAnimation, value: feedback)
         .animation(interfaceAnimation, value: isShowingSmartPreview)
         .onAppear {
             initializeFlow(forceDefault: true)
@@ -242,9 +314,47 @@ struct QuickEntryContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .quickEntryWillOpen)) { _ in
             initializeFlow(forceDefault: true)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .quickEntryDidDismiss)) { _ in
+            initializeFlow(forceDefault: true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .vaultFlushRequested)) { notification in
+            guard let request = notification.object as? VaultFlushRequest,
+                  presentationState.isContentVisible,
+                  hasUnsavedUserDraft
+            else { return }
+            request.recordFailure("Quick Entry still contains an unsaved draft.")
+        }
         .onChange(of: isShowingSmartPreview) { _, _ in
             updateQuickEntryPanelSize(animated: true)
         }
+        .onChange(of: inputText) { _, _ in
+            if isShowingFailureFeedback {
+                feedback = .none
+            }
+        }
+        .onDisappear {
+            cancelSmartRequest()
+        }
+    }
+
+    private var vaultUnavailableView: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.orange)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Vault unavailable")
+                    .font(.system(size: 15, weight: .semibold))
+                Text("Nothing was saved to temporary storage. Press Esc to close.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -316,7 +426,7 @@ struct QuickEntryContentView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .background(.white.opacity(0.08), in: Capsule())
+                    .background(.quaternary.opacity(0.7), in: Capsule())
 
                 Spacer()
 
@@ -326,7 +436,12 @@ struct QuickEntryContentView: View {
                 }
             }
 
-            if let previewValidationMessage {
+            if let errorMessage = feedback.errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.circle.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.red)
+                    .transition(.opacity)
+            } else if let previewValidationMessage {
                 Text(previewValidationMessage)
                     .font(.caption)
                     .foregroundStyle(previewCanSave ? Color.secondary : Color.orange)
@@ -377,13 +492,13 @@ struct QuickEntryContentView: View {
                 Divider()
 
                 if let preview = smartPreview, !preview.fields.isEmpty {
-                    ForEach(preview.fields.indices, id: \.self) { index in
+                    ForEach(preview.fields) { field in
                         EditablePresetFieldRow(
-                            field: preview.fields[index],
-                            value: previewFieldBinding(at: index)
+                            field: field,
+                            value: previewFieldBinding(fieldID: field.id)
                         )
 
-                        if index < preview.fields.count - 1 {
+                        if field.id != preview.fields.last?.id {
                             Divider()
                                 .padding(.leading, 16)
                         }
@@ -437,7 +552,7 @@ struct QuickEntryContentView: View {
             }
             .padding(14)
             .frame(maxHeight: .infinity)
-            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
             Text("Use Back to adjust the original prompt, or switch to Raw Text if you want to keep it untouched.")
                 .font(.caption)
@@ -449,7 +564,7 @@ struct QuickEntryContentView: View {
     private var modePickerView: some View {
         Menu {
             Button {
-                selectSmartMode(preservingDraft: inputText)
+                switchMode(to: .smart)
             } label: {
                 Label("Smart", systemImage: "sparkles")
             }
@@ -459,7 +574,7 @@ struct QuickEntryContentView: View {
 
             ForEach(templates) { template in
                 Button {
-                    select(template: template, preservingDraft: inputText)
+                    switchMode(to: .template(template.id))
                 } label: {
                     Label(template.name, systemImage: template.symbol)
                 }
@@ -551,12 +666,12 @@ struct QuickEntryContentView: View {
                     .controlSize(.small)
                     .frame(width: 34, height: 34)
                     .transition(.opacity.combined(with: .scale))
-            } else if isShowingFailureFeedback {
-                Label(statusText, systemImage: "exclamationmark.circle.fill")
+            } else if let errorMessage = feedback.errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.circle.fill")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Color.red)
                     .lineLimit(1)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                    .transition(.opacity)
             } else {
                 if supportsStepping {
                     if currentFieldIndex > 0 {
@@ -578,17 +693,31 @@ struct QuickEntryContentView: View {
                 }
 
                 Button(action: advanceOrSave) {
-                    Image(systemName: canMoveForward ? "arrow.right" : "return")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 18, height: 18)
+                    HStack(spacing: 5) {
+                        if isSkippingOptionalField && canMoveForward {
+                            Text("Skip")
+                                .font(.caption.weight(.medium))
+                        }
+                        Image(systemName: canMoveForward ? "arrow.right" : "return")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 18, height: 18)
+                    }
                 }
                 .buttonStyle(.bordered)
                 .buttonBorderShape(.roundedRectangle(radius: 9))
                 .controlSize(.small)
                 .tint(appAccentColor)
                 .disabled(!canAdvance)
-                .accessibilityLabel(canMoveForward ? "Next field" : "Save shard")
-                .help(canMoveForward ? "Next field (Return)" : "Submit (Return)")
+                .accessibilityLabel(
+                    isSkippingOptionalField && canMoveForward
+                        ? "Skip optional field"
+                        : (canMoveForward ? "Next field" : "Save shard")
+                )
+                .help(
+                    isSkippingOptionalField && canMoveForward
+                        ? "Skip optional field (Return)"
+                        : (canMoveForward ? "Next field (Return)" : "Submit (Return)")
+                )
             }
         }
     }
@@ -612,6 +741,9 @@ struct QuickEntryContentView: View {
     }
 
     private var placeholderText: String {
+        if let placeholder = currentField?.placeholder, !placeholder.isEmpty {
+            return placeholder
+        }
         let fieldName = currentField?.name ?? "Content"
         return "\(modeDisplayName) · \(fieldName)"
     }
@@ -626,20 +758,40 @@ struct QuickEntryContentView: View {
     }
 
     private var canAdvance: Bool {
-        guard let currentField else { return false }
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !(currentField.isRequired && trimmed.isEmpty)
+        if case .blocked = submissionOutcome { return false }
+        return true
     }
 
     private var canMoveForward: Bool {
-        payloadBuffer.indices.contains(currentFieldIndex) &&
-        currentFieldIndex < payloadBuffer.count - 1 &&
-        canAdvance
+        if case .advance = submissionOutcome { return true }
+        return false
+    }
+
+    private var isSkippingOptionalField: Bool {
+        switch submissionOutcome {
+        case let .advance(_, skipped), let .save(skipped):
+            return skipped
+        case .blocked:
+            return false
+        }
+    }
+
+    private var submissionOutcome: QuickEntrySubmissionOutcome {
+        QuickEntryFormPolicy.submissionOutcome(
+            field: currentField,
+            input: inputText,
+            currentIndex: currentFieldIndex,
+            fieldCount: payloadBuffer.count
+        )
     }
 
     private func initializeFlow(forceDefault: Bool) {
+        cancelSmartRequest()
         isCompletingCapture = false
+        isProcessing = false
         smartPreview = nil
+        feedback = .none
+        modeDrafts = [:]
         updateQuickEntryPanelSize(animated: false)
 
         guard !templates.isEmpty else {
@@ -686,21 +838,31 @@ struct QuickEntryContentView: View {
         }
     }
 
-    private func select(template: PresetTemplate, preservingDraft draft: String? = nil) {
+    private func select(template: PresetTemplate, seedText: String? = nil) {
         smartPreview = nil
         selectedMode = .template(template.id)
         storedSelectedMode = "template:\(template.id)"
-        payloadBuffer = template.fields.isEmpty ? [PresetField(name: "Content", value: "", isRequired: true)] : template.fields
-        if let draft, !draft.isEmpty, !payloadBuffer.isEmpty {
-            payloadBuffer[0].value = draft
+        let mode = QuickEntryMode.template(template.id)
+        if let draft = modeDrafts[mode], !draft.fields.isEmpty {
+            payloadBuffer = draft.fields
+            currentFieldIndex = min(draft.currentFieldIndex, draft.fields.count - 1)
+        } else {
+            payloadBuffer = template.fields.isEmpty
+                ? [PresetField(name: "Content", value: "", isRequired: true)]
+                : template.fields
+            if let seedText, !seedText.isEmpty, !payloadBuffer.isEmpty {
+                payloadBuffer[0].value = seedText
+            }
+            currentFieldIndex = 0
         }
-        currentFieldIndex = 0
-        inputText = payloadBuffer.first?.value ?? ""
-        statusText = template.name
+        inputText = payloadBuffer.indices.contains(currentFieldIndex)
+            ? payloadBuffer[currentFieldIndex].value
+            : ""
+        feedback = .none
         requestInputFocus()
     }
 
-    private func selectSmartMode(preservingDraft draft: String? = nil) {
+    private func selectSmartMode(seedText: String? = nil) {
         guard hasLLMConfigured else {
             apply(mode: resolveMode(from: defaultQuickEntryMode))
             return
@@ -709,33 +871,63 @@ struct QuickEntryContentView: View {
         smartPreview = nil
         selectedMode = .smart
         storedSelectedMode = "smart"
-        payloadBuffer = [PresetField(name: "Content", value: draft ?? "", isRequired: true)]
-        currentFieldIndex = 0
-        inputText = draft ?? ""
-        statusText = "Smart"
+        if let draft = modeDrafts[.smart], !draft.fields.isEmpty {
+            payloadBuffer = draft.fields
+            currentFieldIndex = min(draft.currentFieldIndex, draft.fields.count - 1)
+            inputText = payloadBuffer[currentFieldIndex].value
+        } else {
+            payloadBuffer = [PresetField(name: "Content", value: seedText ?? "", isRequired: true)]
+            currentFieldIndex = 0
+            inputText = seedText ?? ""
+        }
+        feedback = .none
         requestInputFocus()
     }
 
     private func isSecureField(_ field: PresetField) -> Bool {
-        let name = field.name.lowercased()
-        return name.contains("password") || name.contains("secret") || name.contains("token")
+        field.isEffectivelySensitive
     }
 
     private func cycleMode(reverse: Bool) {
+        guard !isProcessing, !isCompletingCapture else { return }
         guard let nextMode = QuickEntryModeCycle.next(
             from: selectedMode,
             in: availableModes,
             reverse: reverse
         ) else { return }
 
-        let draft = inputText
-        switch nextMode {
+        switchMode(to: nextMode)
+    }
+
+    private func switchMode(to mode: QuickEntryMode) {
+        guard mode != selectedMode else { return }
+        // Never carry a credential into an unrelated mode's ordinary text
+        // field. The source mode's complete draft is still cached below.
+        let seedText = QuickEntryModeTransferPolicy.seedText(
+            from: inputText,
+            sourceField: currentField
+        )
+        cacheCurrentModeDraft()
+
+        switch mode {
         case .smart:
-            selectSmartMode(preservingDraft: draft)
+            selectSmartMode(seedText: seedText)
         case let .template(templateID):
             guard let template = templates.first(where: { $0.id == templateID }) else { return }
-            select(template: template, preservingDraft: draft)
+            select(template: template, seedText: seedText)
         }
+    }
+
+    private func cacheCurrentModeDraft() {
+        guard !payloadBuffer.isEmpty else { return }
+        var fields = payloadBuffer
+        if fields.indices.contains(currentFieldIndex) {
+            fields[currentFieldIndex].value = inputText
+        }
+        modeDrafts[selectedMode] = QuickEntryModeDraft(
+            fields: fields,
+            currentFieldIndex: currentFieldIndex
+        )
     }
 
     private func moveToPreviousField() {
@@ -746,23 +938,25 @@ struct QuickEntryContentView: View {
         requestInputFocus()
     }
 
-    private func moveToNextField() {
-        guard canMoveForward else { return }
-        payloadBuffer[currentFieldIndex].value = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        currentFieldIndex += 1
+    private func moveToNextField(_ nextIndex: Int) {
+        guard payloadBuffer.indices.contains(nextIndex) else { return }
+        currentFieldIndex = nextIndex
         inputText = payloadBuffer[currentFieldIndex].value
         requestInputFocus()
     }
 
     private func advanceOrSave() {
-        guard !isProcessing, !isCompletingCapture, currentField != nil, canAdvance else { return }
-        payloadBuffer[currentFieldIndex].value = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if selectedMode != .smart, currentFieldIndex < payloadBuffer.count - 1 {
+        guard !isProcessing, !isCompletingCapture, currentField != nil else { return }
+        switch submissionOutcome {
+        case let .blocked(requiredFieldName):
+            feedback = .error("\(requiredFieldName) is required")
+        case let .advance(nextIndex, _):
+            payloadBuffer[currentFieldIndex].value = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
             withAnimation(interfaceAnimation) {
-                moveToNextField()
+                moveToNextField(nextIndex)
             }
-        } else {
+        case .save:
+            payloadBuffer[currentFieldIndex].value = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
             saveToVault()
         }
     }
@@ -770,7 +964,7 @@ struct QuickEntryContentView: View {
     private func saveToVault() {
         let encryptionMode = ProtectionService.shared.desiredEncryptionModeForNewShard()
         if encryptionMode == .global, ProtectionService.shared.requiresGlobalUnlock {
-            statusText = "Unlock vault to save"
+            feedback = .error("Unlock vault to save")
             isProcessing = false
             return
         }
@@ -788,27 +982,40 @@ struct QuickEntryContentView: View {
             let userText = payloadBuffer.first?.value ?? inputText
             let templateDescriptors = templates.map(\.smartDescriptor)
             let configuration = smartConfiguration
-            Task {
+            smartRequestGeneration &+= 1
+            let requestGeneration = smartRequestGeneration
+            smartRequestTask?.cancel()
+            smartRequestTask = Task {
                 do {
                     let result = try await SmartInputService.shared.process(
                         rawInput: userText,
                         templates: templateDescriptors,
                         configuration: configuration
                     )
-                    await MainActor.run {
-                        presentSmartPreview(result: result, rawInput: userText)
-                    }
+                    try Task.checkCancellation()
+                    guard requestGeneration == smartRequestGeneration else { return }
+                    smartRequestTask = nil
+                    presentSmartPreview(result: result, rawInput: userText)
                 } catch {
-                    await MainActor.run {
-                        statusText = smartFailureStatusText(for: error)
+                    guard requestGeneration == smartRequestGeneration else { return }
+                    smartRequestTask = nil
+                    if error is CancellationError || (error as? URLError)?.code == .cancelled {
                         isProcessing = false
+                        return
                     }
+                    feedback = .error(smartFailureStatusText(for: error))
+                    isProcessing = false
                 }
             }
 
         case .template:
-            let templateName = selectedTemplate?.name
-            let payload = PresetPayload(presetType: templateName ?? "Shard", fields: payloadBuffer)
+            let template = selectedTemplate
+            let templateName = template?.name
+            let payload = PresetPayload(
+                presetType: templateName ?? "Shard",
+                fields: payloadBuffer,
+                templateID: template?.id
+            )
             finishSave(with: payload, templateName: templateName)
         }
     }
@@ -825,16 +1032,23 @@ struct QuickEntryContentView: View {
             selectedTemplateID: matchedTemplate?.id,
             fields: previewFields
         )
-        statusText = "Review Smart Result"
+        feedback = .none
         isProcessing = false
         isInputFocused = false
     }
 
     private func dismissSmartPreview() {
         smartPreview = nil
-        statusText = "Smart"
+        feedback = .none
         isProcessing = false
         requestInputFocus()
+    }
+
+    private func cancelSmartRequest() {
+        smartRequestGeneration &+= 1
+        smartRequestTask?.cancel()
+        smartRequestTask = nil
+        isProcessing = false
     }
 
     private func saveSmartPreview() {
@@ -842,7 +1056,7 @@ struct QuickEntryContentView: View {
 
         let encryptionMode = ProtectionService.shared.desiredEncryptionModeForNewShard()
         if encryptionMode == .global, ProtectionService.shared.requiresGlobalUnlock {
-            statusText = "Unlock vault to save"
+            feedback = .error("Unlock vault to save")
             isProcessing = false
             return
         }
@@ -853,7 +1067,8 @@ struct QuickEntryContentView: View {
             let payload = PresetPayload(
                 presetType: template.name,
                 fields: preview.fields,
-                preferredStyle: template.presentationStyle.rawValue
+                preferredStyle: template.presentationStyle.rawValue,
+                templateID: template.id
             )
             finishSave(with: payload, templateName: template.name)
         } else {
@@ -862,19 +1077,22 @@ struct QuickEntryContentView: View {
     }
 
     private func finishSave(with payload: PresetPayload, templateName: String?) {
-        let context = VaultContainer.shared.container.mainContext
-        let collections = (try? context.fetch(FetchDescriptor<ShardCollection>())) ?? []
         let encryptionMode = ProtectionService.shared.desiredEncryptionModeForNewShard()
-        let matchedTemplate = templateName.flatMap { name in
+        let matchedTemplate = templates.matchingTemplate(for: payload) ?? templateName.flatMap { name in
             templates.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame })
-        } ?? templates.first(where: { $0.name.caseInsensitiveCompare(payload.presetType) == .orderedSame })
-
-        let collectionId = matchedTemplate
-            .flatMap { template in collections.first(where: { $0.name == template.targetCollectionName })?.id }
-            ?? collections.first(where: { $0.name == VaultContainer.Defaults.shardsCollectionName })?.id
-            ?? VaultContainer.Defaults.allCollectionID
+        }
 
         do {
+            let context = VaultContainer.shared.container.mainContext
+            let collections = try context.fetch(FetchDescriptor<ShardCollection>())
+            let collectionId = matchedTemplate
+                .flatMap { template in
+                    collections.first(where: {
+                        $0.name.caseInsensitiveCompare(template.targetCollectionName) == .orderedSame
+                    })?.id
+                }
+                ?? collections.first(where: { $0.name == VaultContainer.Defaults.shardsCollectionName })?.id
+                ?? VaultContainer.Defaults.allCollectionID
             let shard = try VaultRepository.shared.save(
                 payload: payload,
                 collectionId: collectionId,
@@ -887,7 +1105,12 @@ struct QuickEntryContentView: View {
             actions.captureCompleted(shard)
 
         } catch {
-            statusText = "Save failed"
+            if let repositoryError = error as? VaultRepositoryError,
+               case .storeUnavailable = repositoryError {
+                feedback = .error("Vault unavailable")
+            } else {
+                feedback = .error("Save failed")
+            }
             isProcessing = false
         }
     }
@@ -902,11 +1125,12 @@ struct QuickEntryContentView: View {
         return "Smart Parse Failed"
     }
 
-    private func previewFieldBinding(at index: Int) -> Binding<String> {
+    private func previewFieldBinding(fieldID: String) -> Binding<String> {
         Binding(
-            get: { smartPreview?.fields.indices.contains(index) == true ? smartPreview?.fields[index].value ?? "" : "" },
+            get: { smartPreview?.fields.first(where: { $0.id == fieldID })?.value ?? "" },
             set: { newValue in
-                guard var preview = smartPreview, preview.fields.indices.contains(index) else { return }
+                guard var preview = smartPreview,
+                      let index = preview.fields.firstIndex(where: { $0.id == fieldID }) else { return }
                 preview.fields[index].value = newValue
                 smartPreview = preview
             }
@@ -934,6 +1158,9 @@ struct QuickEntryContentView: View {
     }
 
     private func previewTemplate(for result: SmartInputResult) -> PresetTemplate? {
+        if let matchedTemplate = templates.matchingTemplate(for: result.payload) {
+            return matchedTemplate
+        }
         if let templateName = result.templateName,
            let matchedTemplate = templates.first(where: { $0.name.caseInsensitiveCompare(templateName) == .orderedSame }) {
             return matchedTemplate
@@ -955,6 +1182,9 @@ struct QuickEntryContentView: View {
 
         let existingValueMap = existingFields.reduce(into: [String: String]()) { partialResult, field in
             partialResult[normalizeFieldToken(field.name)] = field.value
+            if let key = field.key, !key.isEmpty {
+                partialResult[normalizeFieldToken(key)] = field.value
+            }
         }
 
         for index in rebuiltFields.indices {

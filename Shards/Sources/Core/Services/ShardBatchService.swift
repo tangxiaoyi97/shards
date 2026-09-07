@@ -2,6 +2,10 @@ import AppKit
 import Foundation
 import SwiftData
 
+extension Notification.Name {
+    static let shardsWerePermanentlyDeleted = Notification.Name("shardsWerePermanentlyDeleted")
+}
+
 enum ShardBatchOperation: Equatable, Sendable {
     case setPinned(Bool)
     case addTag(String)
@@ -115,7 +119,7 @@ enum ShardBatchError: LocalizedError, Equatable {
         case .missingTag:
             return "The selected tag no longer exists."
         case .pendingChanges:
-            return "Save the current editor changes before undoing this action."
+            return "Save the current editor changes before continuing."
         case .stateConflict:
             return "The shards changed after this action, so Shards did not overwrite the newer changes."
         case let .persistenceFailed(message):
@@ -242,9 +246,13 @@ final class ShardBatchService {
             }
         }
 
+        // Snapshot every value needed for the receipt before deleting the
+        // SwiftData models. Persisted properties are invalid after deletion.
+        let deletedIDs = eligible.map(\.id)
+
         do {
-            if !eligible.isEmpty {
-                let eligibleIDs = Set(eligible.map(\.id))
+            if !deletedIDs.isEmpty {
+                let eligibleIDs = Set(deletedIDs)
                 let attachments = try context.fetch(FetchDescriptor<ShardAttachment>())
                 for attachment in attachments where eligibleIDs.contains(attachment.shardId) {
                     context.delete(attachment)
@@ -258,7 +266,7 @@ final class ShardBatchService {
         }
 
         return ShardPermanentDeleteReceipt(
-            deletedIDs: eligible.map(\.id),
+            deletedIDs: deletedIDs,
             skippedLockedIDs: skippedLockedIDs,
             skippedLiveIDs: skippedLiveIDs,
             missingIDs: missingIDs

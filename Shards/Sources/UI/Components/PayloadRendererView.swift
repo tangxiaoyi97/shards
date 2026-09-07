@@ -4,26 +4,64 @@ import SwiftUI
 
 struct PayloadRendererView: View {
     @Binding var payloadText: String
-    var shard: Shard? = nil
+    let contentID: String
+    var isEditable = true
     @AppStorage(AppSettingKeys.editorFontSize) private var editorFontSize = 15.0
     @Query(sort: \PresetTemplate.orderIndex, order: .forward) private var templates: [PresetTemplate]
-    var onEdited: (() -> Void)? = nil
+    @State private var isShowingMalformedRawData = false
 
-    private var parsedPreset: PresetPayload? {
-        guard let data = payloadText.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(PresetPayload.self, from: data)
+    private var payloadDecodingResult: PresetPayloadDecodingResult {
+        switch PresetPayload.decoding(payloadText) {
+        case let .decoded(decoded):
+            let schema = templates.matchingTemplate(for: decoded)?.schema
+            return .decoded(decoded.resolvingMetadata(using: schema))
+        case .plainText:
+            return .plainText
+        case .malformedStructured:
+            return .malformedStructured
+        }
     }
 
     var body: some View {
-        if let preset = parsedPreset, !preset.isRaw {
-            switch presentationStyle(for: preset) {
-            case .table:
-                tableRenderer(for: preset)
+        Group {
+            switch payloadDecodingResult {
+            case let .decoded(preset):
+                if preset.isRaw {
+                    textRenderer(for: preset)
+                } else {
+                    switch effectivePresentationStyle(for: preset) {
+                    case .table, .custom:
+                        tableRenderer(for: preset)
+                    case .plainText:
+                        textRenderer(for: preset)
+                    }
+                }
             case .plainText:
-                textRenderer(for: preset)
+                textRenderer(for: nil)
+            case .malformedStructured:
+                if isShowingMalformedRawData {
+                    textRenderer(for: nil)
+                } else {
+                    malformedStructuredContent
+                }
             }
-        } else {
-            textRenderer(for: nil)
+        }
+        .onChange(of: contentID) { _, _ in
+            isShowingMalformedRawData = false
+        }
+    }
+
+    private var malformedStructuredContent: some View {
+        ContentUnavailableView {
+            Label("Structured Content Unavailable", systemImage: "exclamationmark.shield")
+        } description: {
+            Text("This shard could not be decoded. Its raw data may contain sensitive values and remains hidden by default.")
+        } actions: {
+            Button("Show Raw Data") {
+                isShowingMalformedRawData = true
+            }
+            .buttonStyle(.bordered)
+            .accessibilityHint("Reveals the complete undecoded shard")
         }
     }
 
@@ -34,6 +72,7 @@ struct PayloadRendererView: View {
                 ForEach(Array(preset.fields.enumerated()), id: \.element.id) { index, field in
                     EditablePresetFieldRow(
                         field: field,
+                        isEditable: isEditable,
                         value: Binding(
                             get: { value(for: field.id, in: preset) },
                             set: { updatePresetField(fieldID: field.id, value: $0, in: preset) }
@@ -76,8 +115,9 @@ struct PayloadRendererView: View {
                 PlainTextEditorView(
                     text: editorBinding,
                     fontSize: editorFontSize,
-                    onTextChange: { onEdited?() }
+                    isEditable: isEditable
                 )
+                .disabled(!isEditable)
             }
             .frame(maxWidth: 820, maxHeight: .infinity)
             .background(
@@ -115,11 +155,9 @@ struct PayloadRendererView: View {
                         write(payload: updated)
                     } else {
                         payloadText = newValue
-                        onEdited?()
                     }
                 } else {
                     payloadText = newValue
-                    onEdited?()
                 }
             }
         )
@@ -139,14 +177,12 @@ struct PayloadRendererView: View {
     private func write(payload: PresetPayload) {
         if payload.isRaw {
             payloadText = payload.fields.first(where: { $0.name.normalizedFieldKey == "content" })?.value ?? ""
-            onEdited?()
             return
         }
 
         if let data = try? JSONEncoder().encode(payload),
            let json = String(data: data, encoding: .utf8) {
             payloadText = json
-            onEdited?()
         }
     }
 
@@ -154,8 +190,14 @@ struct PayloadRendererView: View {
         template(for: preset)?.presentationStyle ?? inferredPresentationStyle(for: preset)
     }
 
+    private func effectivePresentationStyle(for preset: PresetPayload) -> PresetTemplateSchema.PresentationStyle {
+        preset.fields.contains(where: \.isEffectivelySensitive)
+            ? .table
+            : presentationStyle(for: preset)
+    }
+
     private func template(for preset: PresetPayload) -> PresetTemplate? {
-        templates.first(where: { $0.name.caseInsensitiveCompare(preset.presetType) == .orderedSame })
+        templates.matchingTemplate(for: preset)
     }
 
     private func editableTextField(in preset: PresetPayload) -> PresetField? {
@@ -190,7 +232,6 @@ private struct PlainTextEditorView: NSViewRepresentable {
     @Binding var text: String
     var fontSize: CGFloat
     var isEditable = true
-    var onTextChange: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -270,13 +311,13 @@ private struct PlainTextEditorView: NSViewRepresentable {
             if parent.text != newValue {
                 parent.text = newValue
             }
-            parent.onTextChange?()
         }
     }
 }
 
 struct EditablePresetFieldRow: View {
     let field: PresetField
+    var isEditable = true
     @Binding var value: String
     @AppStorage(AppSettingKeys.editorFontSize) private var editorFontSize = 15.0
     @State private var isRevealed = false
@@ -285,15 +326,28 @@ struct EditablePresetFieldRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isSecret: Bool {
-        let name = field.name.lowercased()
-        return name.contains("password") || name.contains("token") || name.contains("secret") || name.contains("key")
+        field.isEffectivelySensitive
     }
 
     private var isLongForm: Bool {
-        field.name.lowercased().contains("note") || field.name.lowercased().contains("content")
+        field.isEffectivelyLongForm
     }
 
     private var fieldIcon: String {
+        switch field.valueType {
+        case .licenseKey: return "key.viewfinder"
+        case .secret: return "key.fill"
+        case .username: return "person.fill"
+        case .email: return "envelope.fill"
+        case .url: return "link"
+        case .phone: return "phone.fill"
+        case .number: return "number"
+        case .date: return "calendar"
+        case .note: return "doc.text"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .text, .custom, .none: break
+        }
+
         let name = field.name.lowercased()
         if name.contains("password") { return "key.fill" }
         if name.contains("token") || name.contains("key") { return "network.badge.shield.half.filled" }
@@ -320,26 +374,29 @@ struct EditablePresetFieldRow: View {
             .frame(width: 120, alignment: .leading)
 
             Group {
-                if isLongForm {
+                if isSecret && !isRevealed {
+                    SecureField(field.placeholder ?? field.name, text: $value)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: editorFontSize, design: .monospaced))
+                        .disabled(!isEditable)
+                } else if isLongForm {
                     TextEditor(text: $value)
                         .font(.system(size: editorFontSize))
                         .frame(minHeight: 96)
                         .scrollContentBackground(.hidden)
                         .padding(8)
                         .background(.quaternary.opacity(0.32), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                } else if isSecret && !isRevealed {
-                    SecureField(field.name, text: $value)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: editorFontSize, design: .monospaced))
+                        .disabled(!isEditable)
                 } else {
-                    TextField(field.name, text: $value)
+                    TextField(field.placeholder ?? field.name, text: $value)
                         .textFieldStyle(.plain)
                         .font(
-                            isSecret
+                            field.usesMonospacedText
                                 ? .system(size: editorFontSize, design: .monospaced)
                                 : .system(size: editorFontSize)
                         )
                         .textSelection(.enabled)
+                        .disabled(!isEditable)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -347,7 +404,9 @@ struct EditablePresetFieldRow: View {
             HStack(spacing: 6) {
                 if isSecret {
                     Button {
-                        withAnimation(.easeInOut(duration: 0.15)) { isRevealed.toggle() }
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
+                            isRevealed.toggle()
+                        }
                     } label: {
                         Image(systemName: isRevealed ? "eye.slash" : "eye")
                             .font(.system(size: 12))
@@ -356,6 +415,7 @@ struct EditablePresetFieldRow: View {
                     }
                     .buttonStyle(.plain)
                     .help(isRevealed ? "Hide" : "Reveal")
+                    .accessibilityLabel(isRevealed ? "Hide \(field.name)" : "Reveal \(field.name)")
                 }
 
                 Button {
@@ -374,14 +434,21 @@ struct EditablePresetFieldRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("Copy")
+                .accessibilityLabel("Copy \(field.name)")
+                .opacity(isHovered || showCopied ? 1 : 0.38)
             }
-            .opacity(isHovered || showCopied ? 1 : 0)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
         .contentShape(.rect)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: reduceMotion ? 0 : 0.12)) { isHovered = hovering }
+        }
+        .onChange(of: field.id) { _, _ in
+            isRevealed = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            isRevealed = false
         }
     }
 }

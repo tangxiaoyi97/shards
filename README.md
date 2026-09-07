@@ -7,7 +7,7 @@
 <p align="center">A local macOS vault for quick notes</p>
 
 <p align="center">
-  <img alt="Version 1.2.2" src="https://img.shields.io/badge/version-1.2.2-5B4CF0">
+  <img alt="Version 1.3.0" src="https://img.shields.io/badge/version-1.3.0-5B4CF0">
   <img alt="macOS 15 or later" src="https://img.shields.io/badge/platform-macOS_15%2B-111111">
   <img alt="Swift 6" src="https://img.shields.io/badge/language-Swift_6-F05138">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2563EB">
@@ -21,8 +21,8 @@ Shards turns quick notes, clipboard text, and reusable templates into searchable
 
 - Spotlight-style Quick Entry with `Command–Shift–S`; use `Tab` to cycle modes and `Escape` to close it.
 - Local clipboard capture from the menu bar.
-- Search, native multi-selection, drag-to-tag, pinning, Trash, and restore.
-- Reusable templates for structured information.
+- Search in the app or macOS Spotlight, native multi-selection, drag-to-tag, pinning, Trash, and restore.
+- Extensible templates for structured information, including sensitive fields that stay concealed until revealed.
 - Optional Smart mode with an editable preview; it does not read historical Vault content.
 - Global or per-Shard password protection, JSON/CSV import and export.
 - System, Light, and Dark appearances; manual signed updates through Sparkle.

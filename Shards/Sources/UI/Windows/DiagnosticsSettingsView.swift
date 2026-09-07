@@ -46,6 +46,7 @@ struct SoftwareUpdateSettingsCard: View {
 
 struct DiagnosticsSettingsView: View {
     @ObservedObject private var updates = UpdateController.shared
+    @ObservedObject private var spotlight = SpotlightIndexingService.shared
     @State private var backups: [VaultBackupService.BackupSummary] = []
     @State private var backupMessage: String?
     @State private var backupIsError = false
@@ -118,6 +119,7 @@ struct DiagnosticsSettingsView: View {
                 diagnosticsRow("macOS", ProcessInfo.processInfo.operatingSystemVersionString)
                 diagnosticsRow("Architecture", Self.architecture)
                 diagnosticsRow("Update", updates.statusMessage)
+                diagnosticsRow("Spotlight", spotlight.statusMessage)
 
                 Button("Copy Diagnostics") {
                     NSPasteboard.general.clearContents()
@@ -154,7 +156,8 @@ struct DiagnosticsSettingsView: View {
             "Architecture: \(Self.architecture)",
             "Store: \(VaultContainer.storeURL.path)",
             "Backups: \(backups.count)",
-            "Update: \(updates.statusMessage)"
+            "Update: \(updates.statusMessage)",
+            "Spotlight: \(spotlight.statusMessage)"
         ].joined(separator: "\n")
     }
 
